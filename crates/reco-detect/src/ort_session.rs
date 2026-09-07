@@ -310,6 +310,38 @@ pub fn create_ort_session(
     Ok((session, input_size, labels))
 }
 
+/// Whether an ONNX session's output shapes match RF-DETR's export
+/// convention rather than stock YOLO's.
+///
+/// RF-DETR (`scripts/export_rfdetr_onnx.py`) always produces exactly
+/// two outputs: boxes `[1, Q, 4]` and per-class logits `[1, Q, C]`.
+/// Stock end-to-end-NMS YOLO produces one fused `[1, N, 6]` output;
+/// the external ball-detector variant ([`crate::detectors::postprocess_balldet`])
+/// produces multiple outputs but its primary one is still the fused
+/// `[.., 6]` layout. Requiring the second output's last dimension to
+/// differ from `6` is what tells the two multi-output cases apart.
+///
+/// Used by `reco-autocam::setup_autocam` to pick [`crate::CpuDetrDetector`]
+/// over [`crate::CpuYoloDetector`] for a given `.onnx` file without a
+/// separate CLI flag - the model's own declared shape is the source of
+/// truth, not a naming convention or file extension.
+pub fn is_rf_detr_output_shape(session: &Session) -> bool {
+    let outputs = session.outputs();
+    if outputs.len() != 2 {
+        return false;
+    }
+    let last_dim = |idx: usize| -> Option<i64> {
+        match outputs[idx].dtype() {
+            ort::value::ValueType::Tensor { shape, .. } => shape.last().copied(),
+            _ => None,
+        }
+    };
+    match (last_dim(0), last_dim(1)) {
+        (Some(4), Some(d1)) => d1 != 6,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

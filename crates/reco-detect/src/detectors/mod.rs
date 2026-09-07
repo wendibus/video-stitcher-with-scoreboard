@@ -5,6 +5,8 @@
 
 #[cfg(feature = "ort")]
 pub mod cpu;
+#[cfg(feature = "ort")]
+pub mod cpu_detr;
 #[cfg(all(feature = "ort", target_os = "macos"))]
 pub mod metal;
 #[cfg(feature = "ncnn")]
@@ -16,7 +18,44 @@ pub mod trt;
 
 use std::path::Path;
 
-use reco_core::detect::detector::{CameraId, Detection};
+use reco_core::detect::detector::{CameraId, ChromaFormat, Detection, RawFrame};
+
+/// Sample chroma (U, V) values at a given pixel position.
+///
+/// Shared by every CPU-side preprocessor ([`cpu`], [`cpu_detr`]) that
+/// needs to convert a raw YUV camera frame to RGB before resizing.
+#[cfg(feature = "ort")]
+pub(super) fn chroma_sample(frame: &RawFrame<'_>, x: u32, y: u32) -> (f32, f32) {
+    let cx = (x / 2) as usize;
+    let cy = (y / 2) as usize;
+    let cw = (frame.width / 2) as usize;
+
+    match &frame.chroma {
+        ChromaFormat::Yuv420p { u, v } => {
+            let idx = cy * cw + cx;
+            (u[idx] as f32, v[idx] as f32)
+        }
+        ChromaFormat::Nv12 { uv } => {
+            // Interleaved: U at even indices, V at odd indices.
+            let idx = cy * (frame.width as usize) + cx * 2;
+            (uv[idx] as f32, uv[idx + 1] as f32)
+        }
+    }
+}
+
+/// BT.601 full-range YUV -> RGB, in `[0, 255]`.
+///
+/// Matches the JPEG/OpenCV training pipeline and NPP's
+/// `nppiNV12ToRGB` - the canonical color conversion every reco-detect
+/// backend must agree on (see `cpu.rs`'s and `cpu_detr.rs`'s module
+/// docs for the rest of their respective preprocessing specs).
+#[cfg(feature = "ort")]
+pub(super) fn bt601_yuv_to_rgb(y: f32, u: f32, v: f32) -> (f32, f32, f32) {
+    let r = (y + 1.402 * (v - 128.0)).clamp(0.0, 255.0);
+    let g = (y - 0.344136 * (u - 128.0) - 0.714136 * (v - 128.0)).clamp(0.0, 255.0);
+    let b = (y + 1.772 * (u - 128.0)).clamp(0.0, 255.0);
+    (r, g, b)
+}
 
 /// Parse YOLO end-to-end NMS output `[1, N, 6]` into detections.
 ///
@@ -179,6 +218,95 @@ pub fn postprocess_balldet(
         });
     }
     greedy_nms(cands, 0.45)
+}
+
+/// Parse RF-DETR raw output (two tensors: boxes + class logits) into detections.
+///
+/// RF-DETR is exported without NMS and without letterboxing (see
+/// `scripts/export_rfdetr_onnx.py`): `dets` is `[1, num_queries, 4]`
+/// cxcywh normalized to the model's square input resolution, and
+/// `labels` is `[1, num_queries, num_classes]` raw per-class logits (a
+/// sigmoid, not a softmax - RF-DETR's focal-loss classification head).
+/// Because the model input isn't letterboxed, normalized box
+/// coordinates map directly to normalized frame coordinates - no
+/// un-letterbox step, unlike [`postprocess`]/[`postprocess_balldet`].
+///
+/// Tracks a single ball class (index 0); the remaining class slot(s)
+/// are RF-DETR's exported background slot and are ignored (library
+/// convention: the last class slot is background, see rfdetr's
+/// `export/_onnx/inference.py` `background_class_id=-1` default). Only
+/// the single highest-scoring query above `confidence_threshold` is
+/// kept, since a ball-only camera has at most one real ball in frame -
+/// this consumer doesn't need RF-DETR's own multi-class top-k
+/// selection.
+pub fn postprocess_detr(
+    dets: &[f32],
+    labels: &[f32],
+    num_queries: usize,
+    num_classes: usize,
+    camera: CameraId,
+    confidence_threshold: f32,
+) -> Vec<Detection> {
+    /// Single-class ball model: class slot 0 = "ball" (last slot = background).
+    const BALL_CLASS_ID: u16 = 0;
+
+    let expected_dets = num_queries * 4;
+    let expected_labels = num_queries * num_classes;
+    if num_classes == 0 || dets.len() < expected_dets || labels.len() < expected_labels {
+        log::error!(
+            "RF-DETR output buffer too small or malformed: dets {} floats (need {}), \
+             labels {} floats (need {}), num_classes={num_classes}",
+            dets.len(),
+            expected_dets,
+            labels.len(),
+            expected_labels,
+        );
+        return Vec::new();
+    }
+
+    // Single-pass argmax over the ball-class logit across all queries -
+    // no top-k needed for a single tracked class.
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_query: Option<usize> = None;
+    for q in 0..num_queries {
+        let logit = labels[q * num_classes];
+        if !logit.is_finite() {
+            continue;
+        }
+        // NaN-safe: `best_score` starts at NEG_INFINITY so the first
+        // finite logit always wins the comparison.
+        let score = 1.0 / (1.0 + (-logit).exp());
+        if score > best_score {
+            best_score = score;
+            best_query = Some(q);
+        }
+    }
+
+    let Some(q) = best_query else {
+        return Vec::new();
+    };
+    if best_score < confidence_threshold {
+        return Vec::new();
+    }
+
+    let base = q * 4;
+    let (cx, cy, w, h) = (dets[base], dets[base + 1], dets[base + 2], dets[base + 3]);
+    if !cx.is_finite() || !cy.is_finite() || !w.is_finite() || !h.is_finite() {
+        return Vec::new();
+    }
+    if !(0.0..=1.0).contains(&cx) || !(0.0..=1.0).contains(&cy) {
+        return Vec::new();
+    }
+
+    vec![Detection {
+        camera,
+        class_id: BALL_CLASS_ID,
+        confidence: best_score,
+        center_x: cx.clamp(0.0, 1.0),
+        center_y: cy.clamp(0.0, 1.0),
+        width: w.clamp(0.0, 1.0),
+        height: h.clamp(0.0, 1.0),
+    }]
 }
 
 /// IoU of two normalized center+size detection boxes.
@@ -618,5 +746,84 @@ mod tests {
             (dets[0].confidence - 0.90).abs() < 1e-6,
             "highest-conf first"
         );
+    }
+
+    /// Build a synthetic RF-DETR `(dets, labels)` pair: `queries` is
+    /// `[(cx, cy, w, h, ball_logit)]`; `num_classes` fixes the labels
+    /// row width (class 0 = ball, remaining slots = background, left
+    /// at 0.0 since only the ball logit is read).
+    fn make_detr_tensors(
+        queries: &[(f32, f32, f32, f32, f32)],
+        num_classes: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut dets = Vec::with_capacity(queries.len() * 4);
+        let mut labels = Vec::with_capacity(queries.len() * num_classes);
+        for &(cx, cy, w, h, ball_logit) in queries {
+            dets.extend_from_slice(&[cx, cy, w, h]);
+            let mut row = vec![0.0_f32; num_classes];
+            row[0] = ball_logit;
+            labels.extend_from_slice(&row);
+        }
+        (dets, labels)
+    }
+
+    fn logit_for_prob(p: f32) -> f32 {
+        (p / (1.0 - p)).ln()
+    }
+
+    #[test]
+    fn postprocess_detr_decodes_normalized_cxcywh_directly() {
+        // No letterbox for RF-DETR: normalized coords pass straight through.
+        let (dets, labels) = make_detr_tensors(&[(0.5, 0.25, 0.04, 0.05, logit_for_prob(0.9))], 2);
+        let out = postprocess_detr(&dets, &labels, 1, 2, CameraId::Left, 0.4);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].class_id, 0);
+        assert!((out[0].confidence - 0.9).abs() < 1e-3);
+        assert!((out[0].center_x - 0.5).abs() < 1e-6);
+        assert!((out[0].center_y - 0.25).abs() < 1e-6);
+        assert!((out[0].width - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn postprocess_detr_picks_highest_scoring_query() {
+        let (dets, labels) = make_detr_tensors(
+            &[
+                (0.1, 0.1, 0.02, 0.02, logit_for_prob(0.3)),
+                (0.8, 0.6, 0.03, 0.03, logit_for_prob(0.95)),
+                (0.5, 0.5, 0.02, 0.02, logit_for_prob(0.5)),
+            ],
+            2,
+        );
+        let out = postprocess_detr(&dets, &labels, 3, 2, CameraId::Left, 0.1);
+        assert_eq!(out.len(), 1, "only the single best query is kept");
+        assert!((out[0].center_x - 0.8).abs() < 1e-6);
+        assert!((out[0].confidence - 0.95).abs() < 1e-3);
+    }
+
+    #[test]
+    fn postprocess_detr_below_threshold_returns_empty() {
+        let (dets, labels) = make_detr_tensors(&[(0.5, 0.5, 0.02, 0.02, logit_for_prob(0.2))], 2);
+        let out = postprocess_detr(&dets, &labels, 1, 2, CameraId::Left, 0.4);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn postprocess_detr_rejects_nan_logit() {
+        let (dets, labels) = make_detr_tensors(&[(0.5, 0.5, 0.02, 0.02, f32::NAN)], 2);
+        let out = postprocess_detr(&dets, &labels, 1, 2, CameraId::Left, 0.0);
+        assert!(out.is_empty(), "NaN logit must not win argmax");
+    }
+
+    #[test]
+    fn postprocess_detr_rejects_out_of_range_box_center() {
+        let (dets, labels) = make_detr_tensors(&[(1.5, 0.5, 0.02, 0.02, logit_for_prob(0.9))], 2);
+        let out = postprocess_detr(&dets, &labels, 1, 2, CameraId::Left, 0.1);
+        assert!(out.is_empty(), "out-of-[0,1] center must be rejected");
+    }
+
+    #[test]
+    fn postprocess_detr_rejects_undersized_buffers() {
+        let out = postprocess_detr(&[0.0; 2], &[0.0; 2], 1, 2, CameraId::Left, 0.1);
+        assert!(out.is_empty());
     }
 }

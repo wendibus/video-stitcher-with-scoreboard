@@ -56,6 +56,8 @@ mod tracking_mode;
 // and rely on tensorrt-native + .engine models don't see these
 // re-exports.
 #[cfg(feature = "ort")]
+pub use reco_detect::CpuDetrDetector;
+#[cfg(feature = "ort")]
 pub use reco_detect::CpuYoloDetector;
 #[cfg(all(feature = "ort", target_os = "macos"))]
 pub use reco_detect::MetalYoloDetector;
@@ -225,10 +227,25 @@ pub fn setup_autocam(
     // When ort is disabled entirely, fall through to empty names —
     // directors use defaults or a sidecar labels file.
     let is_onnx = model_path.ends_with(".onnx");
+    // Whether the .onnx model is an RF-DETR export (two outputs: `[.., 4]`
+    // boxes + per-class logits) rather than stock/balldet YOLO - decided
+    // once here, from the model's own declared output shapes, and reused
+    // by every `.onnx`-consuming branch below so they never disagree.
+    // See `reco_detect::is_rf_detr_output_shape` for why shape (not file
+    // extension or a CLI flag) is the right signal: both architectures
+    // ship as plain `.onnx`.
+    #[cfg(feature = "ort")]
+    let mut is_rf_detr = false;
     #[cfg(feature = "ort")]
     let class_names = if is_onnx {
         match reco_detect::create_ort_session(Path::new(model_path), Vec::new()) {
-            Ok((_, _, names)) => names,
+            Ok((session, _, names)) => {
+                is_rf_detr = reco_detect::is_rf_detr_output_shape(&session);
+                if is_rf_detr {
+                    log::info!("Autocam: model {model_path} looks like an RF-DETR export");
+                }
+                names
+            }
             Err(e) => {
                 log::warn!("Could not read model labels: {e}, using COCO defaults");
                 Vec::new()
@@ -330,7 +347,7 @@ pub fn setup_autocam(
     // On Windows, D3D11VA zero-copy produces WgpuNv12 frames instead — use the wgpu preprocessing
     // path below which wraps CpuYoloDetector (still gets TensorRT EP for inference).
     #[cfg(all(feature = "ort", target_os = "linux"))]
-    if !detection_active && use_zero_copy {
+    if !detection_active && use_zero_copy && !is_rf_detr {
         match OrtGpuDetector::try_new(
             model_path,
             input_width,
@@ -360,7 +377,7 @@ pub fn setup_autocam(
     }
 
     #[cfg(all(feature = "ort", target_os = "macos"))]
-    if use_zero_copy {
+    if use_zero_copy && !is_rf_detr {
         match MetalYoloDetector::try_new(
             model_path,
             target.gpu(),
@@ -420,7 +437,7 @@ pub fn setup_autocam(
     // preprocessor (NV12 → float32 CHW) + CpuYoloDetector with DirectML EP.
     // Works on any DX12 GPU including Pascal, AMD, and Intel.
     #[cfg(feature = "ort")]
-    if !detection_active && use_zero_copy {
+    if !detection_active && use_zero_copy && !is_rf_detr {
         let gpu = target.gpu();
         let yolo = CpuYoloDetector::with_config(
             model_path,
@@ -447,20 +464,48 @@ pub fn setup_autocam(
         log::info!("Autocam: wgpu preprocessing + DirectML tracking enabled (model: {model_path})");
     }
 
-    // ORT CPU fallback for .onnx files.
+    // ORT CPU fallback for .onnx files: RF-DETR and stock/balldet YOLO
+    // both land here, dispatched by `is_rf_detr` (see above). RF-DETR
+    // has no GPU-resident detector yet (no wgpu preprocessing shader
+    // for its no-letterbox/ImageNet-normalize spec) - only this CPU
+    // path supports it today.
     #[cfg(feature = "ort")]
     if !detection_active && !use_zero_copy {
         let conf = config.confidence_threshold.unwrap_or(0.10);
-        let yolo = CpuYoloDetector::with_config(model_path, conf, Vec::new())?;
-        let detector: Box<dyn reco_core::detect::detector::UnifiedDetector> =
+        let detector: Box<dyn reco_core::detect::detector::UnifiedDetector> = if is_rf_detr {
+            let detr = CpuDetrDetector::with_config(model_path, conf)?;
+            if let Some(roi) = effective_roi {
+                wrap_with_roi(Box::new(detr), roi)
+            } else {
+                Box::new(detr)
+            }
+        } else {
+            let yolo = CpuYoloDetector::with_config(model_path, conf, Vec::new())?;
             if let Some(roi) = effective_roi {
                 wrap_with_roi(Box::new(yolo), roi)
             } else {
                 Box::new(yolo)
-            };
+            }
+        };
         target.set_detector(detector);
         detection_active = true;
-        log::info!("Autocam: YOLO ball tracking enabled (model: {model_path})");
+        log::info!(
+            "Autocam: {} ball tracking enabled (model: {model_path})",
+            if is_rf_detr { "RF-DETR" } else { "YOLO" }
+        );
+    }
+    // RF-DETR has no GPU-resident detector yet (see the `!is_rf_detr`
+    // guards above) - a zero-copy session with an RF-DETR model falls
+    // through every GPU branch and lands here undetected. Say so
+    // explicitly instead of silently running without autocam, which
+    // would otherwise look identical to "no detector backend compiled in".
+    #[cfg(feature = "ort")]
+    if !detection_active && use_zero_copy && is_rf_detr {
+        log::warn!(
+            "Autocam: {model_path} is an RF-DETR model, which only has a CPU (non-zero-copy) \
+             detector today. Re-run with a non-zero-copy source, or use a YOLO model for \
+             zero-copy GPU tracking."
+        );
     }
     // Without ort feature, detection only activates via the
     // tensorrt-native or ncnn branches above. If we still don't

@@ -19,10 +19,10 @@ use std::path::Path;
 use ort::session::Session;
 use ort::value::TensorRef;
 use reco_core::detect::detector::{
-    CameraId, ChromaFormat, Detection, DetectorError, DetectorFrame, RawFrame, UnifiedDetector,
+    CameraId, Detection, DetectorError, DetectorFrame, RawFrame, UnifiedDetector,
 };
 
-use super::{postprocess, postprocess_balldet};
+use super::{bt601_yuv_to_rgb, chroma_sample, postprocess, postprocess_balldet};
 
 /// YOLO-based object detector using ONNX Runtime on CPU.
 ///
@@ -150,13 +150,7 @@ impl CpuYoloDetector {
                 let sample_rgb = |sx: u32, sy: u32| -> (f32, f32, f32) {
                     let y_val = frame.y[(sy * frame.width + sx) as usize] as f32;
                     let (u_val, v_val) = chroma_sample(frame, sx, sy);
-                    // BT.601 full-range YUV -> RGB (matches JPEG/OpenCV
-                    // training pipeline and NPP GPU path)
-                    let r = (y_val + 1.402 * (v_val - 128.0)).clamp(0.0, 255.0);
-                    let g = (y_val - 0.344136 * (u_val - 128.0) - 0.714136 * (v_val - 128.0))
-                        .clamp(0.0, 255.0);
-                    let b = (y_val + 1.772 * (u_val - 128.0)).clamp(0.0, 255.0);
-                    (r, g, b)
+                    bt601_yuv_to_rgb(y_val, u_val, v_val)
                 };
 
                 let (r00, g00, b00) = sample_rgb(x0, y0);
@@ -184,25 +178,6 @@ impl CpuYoloDetector {
         }
 
         (scale, pad_x, pad_y)
-    }
-}
-
-/// Sample chroma (U, V) values at a given pixel position.
-fn chroma_sample(frame: &RawFrame<'_>, x: u32, y: u32) -> (f32, f32) {
-    let cx = (x / 2) as usize;
-    let cy = (y / 2) as usize;
-    let cw = (frame.width / 2) as usize;
-
-    match &frame.chroma {
-        ChromaFormat::Yuv420p { u, v } => {
-            let idx = cy * cw + cx;
-            (u[idx] as f32, v[idx] as f32)
-        }
-        ChromaFormat::Nv12 { uv } => {
-            // Interleaved: U at even indices, V at odd indices.
-            let idx = cy * (frame.width as usize) + cx * 2;
-            (uv[idx] as f32, uv[idx + 1] as f32)
-        }
     }
 }
 

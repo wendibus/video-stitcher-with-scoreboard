@@ -3,6 +3,9 @@
 //! This crate owns all object detection implementations:
 //!
 //! - [`CpuYoloDetector`] - ONNX-based YOLO on CPU (all platforms)
+//! - [`CpuDetrDetector`] - ONNX-based RF-DETR (sport-specific, single-class ball
+//!   models) on CPU (all platforms); no GPU-resident counterpart yet, see the
+//!   dispatch note in `reco-autocam`'s `setup_autocam`
 //! - [`OrtGpuDetector`] - ONNX Runtime + TensorRT/CUDA EP on GPU-resident NV12 frames
 //! - `MetalYoloDetector` - Metal compute + CoreML/ORT on macOS zero-copy frames (cfg macos)
 //! - `TrtGpuDetector` - Native TensorRT inference, no ORT dependency (feature `tensorrt-native`)
@@ -49,6 +52,8 @@ pub mod wgpu_preprocess;
 // Re-export detector types at crate root for convenience.
 #[cfg(feature = "ort")]
 pub use detectors::cpu::CpuYoloDetector;
+#[cfg(feature = "ort")]
+pub use detectors::cpu_detr::CpuDetrDetector;
 #[cfg(all(feature = "ort", target_os = "macos"))]
 pub use detectors::metal::MetalYoloDetector;
 #[cfg(feature = "ncnn")]
@@ -60,11 +65,12 @@ pub use detectors::trt::TrtGpuDetector;
 
 // Re-export shared utilities.
 pub use detectors::postprocess;
+pub use detectors::postprocess_detr;
 pub use detectors::read_labels_file;
 #[cfg(any(feature = "tensorrt", feature = "coreml"))]
 pub use ort_session::reco_cache_dir;
 #[cfg(feature = "ort")]
-pub use ort_session::{SessionError, create_ort_session};
+pub use ort_session::{SessionError, create_ort_session, is_rf_detr_output_shape};
 #[cfg(feature = "ort")]
 pub use probe::{AiProbeResult, probe_execution_providers};
 

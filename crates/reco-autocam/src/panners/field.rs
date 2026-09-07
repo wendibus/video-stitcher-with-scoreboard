@@ -253,7 +253,7 @@ impl Default for FieldPannerConfig {
 }
 
 /// Names accepted by [`FieldPannerConfig::from_preset_name`].
-pub const PRESET_NAMES: &[&str] = &["broadcast", "action", "frame_all"];
+pub const PRESET_NAMES: &[&str] = &["broadcast", "action", "frame_all", "basketball"];
 
 impl FieldPannerConfig {
     /// Calm, anticipatory broadcast framing - the validated default.
@@ -290,12 +290,40 @@ impl FieldPannerConfig {
         }
     }
 
+    /// Indoor court sports (basketball, handball, ...) with a
+    /// single-class ball detector - meant for [`crate::TrackingMode::Ball`],
+    /// which forces `ball_weight = 1.0` regardless of this preset since
+    /// there is no player cluster to blend against.
+    ///
+    /// A much smaller playing surface than football means the same
+    /// physical ball speed sweeps a larger angular distance per
+    /// second, so the chase needs a higher velocity ceiling and more
+    /// lookahead reactivity than [`Self::action`] to keep up without
+    /// widening the dead zone. Unlike [`Self::default`]'s
+    /// [`FieldPannerConfig::max_velocity_rad_per_sec`], this is
+    /// derived from court geometry, not match footage - treat it as a
+    /// documented starting point, not a validated default like
+    /// [`Self::broadcast`]/[`Self::action`].
+    pub fn basketball() -> Self {
+        Self {
+            dead_zone_rad: 0.10,
+            max_velocity_rad_per_sec: 0.28,
+            lookahead_reactivity: 3.5,
+            fov_tight: 18.0,
+            fov_wide: 44.0,
+            fov_default: 30.0,
+            ball_weight: 1.0,
+            ..Self::default()
+        }
+    }
+
     /// Resolve a [`PRESET_NAMES`] entry to its config (case-insensitive).
     pub fn from_preset_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "broadcast" => Some(Self::broadcast()),
             "action" => Some(Self::action()),
             "frame_all" => Some(Self::frame_all()),
+            "basketball" => Some(Self::basketball()),
             _ => None,
         }
     }
@@ -1106,6 +1134,29 @@ mod tests {
             let c = FieldPannerConfig::from_preset_name(name).unwrap();
             assert_eq!(c.clone(), c.sanitized());
         }
+    }
+
+    #[test]
+    fn basketball_preset_chases_faster_than_action() {
+        assert!(FieldPannerConfig::from_preset_name("basketball").is_some());
+        assert!(FieldPannerConfig::from_preset_name("BASKETBALL").is_some());
+
+        let a = FieldPannerConfig::action();
+        let bb = FieldPannerConfig::basketball();
+
+        assert_eq!(
+            bb.ball_weight, 1.0,
+            "ball-only preset has no cluster to blend against"
+        );
+        assert!(
+            bb.max_velocity_rad_per_sec > a.max_velocity_rad_per_sec,
+            "small court needs a faster chase for the same physical ball speed"
+        );
+        assert!(bb.lookahead_reactivity > a.lookahead_reactivity);
+        assert!(
+            bb.fov_wide < a.fov_wide,
+            "indoor court is tighter than a pitch"
+        );
     }
 
     fn player(yaw: f32, pitch: f32, id: u64) -> TrackedEntity {

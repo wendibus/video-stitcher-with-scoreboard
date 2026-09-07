@@ -272,7 +272,8 @@ enum Commands {
         #[arg(long = "panner-config")]
         panner_config: Option<String>,
 
-        /// Named panner preset: broadcast (default), action, frame_all.
+        /// Named panner preset: broadcast (default), action, frame_all,
+        /// basketball (indoor court, single-class ball models).
         #[arg(long = "panner-preset")]
         panner_preset: Option<String>,
     },
