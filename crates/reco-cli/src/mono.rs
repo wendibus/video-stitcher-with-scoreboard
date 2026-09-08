@@ -1,9 +1,12 @@
 //! Mono subcommand: track a ball in a single-camera (not yet
 //! stitched/projected) video and encode the followed crop.
 //!
-//! Uses `MonoJob` (Layer 3 API, `reco-io`). No calibration file: the
-//! cylindrical projection needs only lens/geometry parameters, not a
-//! two-camera stereo calibration - see `MonoStitchCoreConfig`.
+//! Uses `MonoJob` (Layer 3 API, `reco-io`). Requires a calibration
+//! file from `reco calibrate-mono` - the KB4 fisheye undistortion
+//! this renders with needs the camera's own intrinsics, unlike the
+//! earlier cylindrical-projection model (which assumed pre-stitched
+//! panorama input and turned out to be the wrong model for a raw
+//! camera recording - see `kb4_mono.wgsl`'s doc comment).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -12,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 pub struct MonoArgs<'a> {
     pub input: &'a str,
     pub output: &'a str,
+    pub calibration: &'a str,
     pub width: u32,
     pub height: u32,
     pub encoder_name: Option<String>,
@@ -57,7 +61,29 @@ pub fn run_mono(args: MonoArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow::Re
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --quality: {e}"))?;
 
-    let mut job = reco_io::MonoJob::new(args.input, args.output)
+    let calibration_json = std::fs::read_to_string(args.calibration)
+        .map_err(|e| anyhow::anyhow!("reading --calibration {}: {e}", args.calibration))?;
+    let calibration: reco_calibrate::mono_optimizer::MonoCalibrationResult =
+        serde_json::from_str(&calibration_json)
+            .map_err(|e| anyhow::anyhow!("parsing --calibration {}: {e}", args.calibration))?;
+    if calibration.mean_reprojection_error_px > 15.0 {
+        log::warn!(
+            "--calibration {} has a high reprojection error ({:.1}px) - the source \
+             calibrate-mono solve may not have converged well; the rendered output may be \
+             visibly wrong",
+            args.calibration,
+            calibration.mean_reprojection_error_px
+        );
+    }
+    log::info!(
+        "Calibration loaded: fx=fy={:.1}px k1={:.4} k2={:.4} (reprojection error {:.1}px)",
+        calibration.camera.fx,
+        calibration.camera.d[0],
+        calibration.camera.d[1],
+        calibration.mean_reprojection_error_px
+    );
+
+    let mut job = reco_io::MonoJob::new(args.input, args.output, calibration.camera)
         .codec(codec)
         .quality(quality)
         .resolution(args.width, args.height)

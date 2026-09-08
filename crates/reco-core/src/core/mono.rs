@@ -1,14 +1,15 @@
-//! `MonoStitchCore` - push-first entry point for the single-input
-//! cylindrical pipeline.
+//! `MonoStitchCore` - push-first entry point for the single-input KB4
+//! fisheye pipeline.
 //!
 //! Mirrors [`StitchCore`](super::StitchCore) (see `core/mod.rs`'s
 //! module docs for the design rationale that also applies here) but
 //! wraps [`MonoPipeline`] instead of [`StitchPipeline`](crate::render::pipeline::StitchPipeline)
-//! and drives one camera instead of two. Deliberately does not carry
-//! replay-buffer / stacked-recorder support: v1 scope is file-based
-//! mono ball tracking (load one already-recorded video, track the
-//! ball, render the followed crop), not live production recording.
-//! Trackers, panner, and detector are the exact same trait objects
+//! and drives one raw, uncorrected fisheye camera instead of two
+//! stitched ones. Deliberately does not carry replay-buffer / stacked-
+//! recorder support: v1 scope is file-based mono ball tracking (load
+//! one already-recorded video, track the ball, render the followed
+//! crop), not live production recording. Trackers, panner, and
+//! detector are the exact same trait objects
 //! [`StitchCore`](super::StitchCore) uses, so `reco_autocam::setup_autocam`
 //! configures either through the shared
 //! [`DetectionTarget`](crate::detect::DetectionTarget) trait without
@@ -16,6 +17,7 @@
 
 use std::time::Instant;
 
+use crate::calibration::CameraParams;
 use crate::detect::DetectionTarget;
 use crate::detect::detector::UnifiedDetector;
 use crate::detect::detector::{CameraId, ChromaFormat, Detection, DetectorFrame, RawFrame};
@@ -24,9 +26,7 @@ use crate::detect::panner::Panner;
 use crate::detect::tracker::Tracker;
 use crate::gpu::GpuContext;
 use crate::gpu::rgba_readback::RgbaReadback;
-use crate::projection::{
-    CylindricalProjectionConfig, cylindrical_panorama_bounds, cylindrical_to_panorama,
-};
+use crate::projection::{kb4_mono_panorama_bounds, kb4_mono_to_panorama};
 use crate::render::mono_pipeline::MonoPipeline;
 use crate::render::pipeline::YuvPlanes;
 use crate::render::renderer::InputFormat;
@@ -34,14 +34,26 @@ use crate::render::viewport::ViewportConfig;
 
 use super::types::{RenderOutcome, StitchCoreError};
 
+/// Default max angle (radians) from the optical axis a mono
+/// calibration is trusted for, when the caller doesn't override it -
+/// matches the widest lens [`reco_calibrate::mono_optimizer`]'s
+/// multi-start grid searches (110 degrees half-FOV). Conservative by
+/// construction: real lenses are usually narrower, so this rarely
+/// clips a genuinely valid sample, but the flat default should be
+/// tightened once a specific camera's real usable field of view is
+/// known - see `kb4_mono.wgsl`'s doc comment.
+pub const DEFAULT_MAX_THETA_RAD: f32 = 1.919_862_2; // 110 degrees
+
 /// Configuration for [`MonoStitchCore::new`]. All fields have sensible
-/// defaults except `input_width`/`input_height`, which must match the
-/// source video.
+/// defaults except `camera`, `input_width`, and `input_height`.
 #[derive(Debug, Clone)]
 pub struct MonoStitchCoreConfig {
-    /// Cylindrical projection geometry (focal length, angular sweep,
-    /// screen rotation, video height).
-    pub projection: CylindricalProjectionConfig,
+    /// Calibrated KB4 fisheye intrinsics for this camera (from `reco
+    /// calibrate-mono`).
+    pub camera: CameraParams,
+    /// Max angle (radians) from the optical axis this calibration is
+    /// trusted for. Defaults to [`DEFAULT_MAX_THETA_RAD`].
+    pub max_theta_rad: f32,
     /// Output viewport (dimensions, FOV, rig tilt/roll).
     pub viewport: ViewportConfig,
     /// Input frame width in pixels.
@@ -59,20 +71,37 @@ pub struct MonoStitchCoreConfig {
 impl MonoStitchCoreConfig {
     /// New config with required fields only; defaults everywhere else.
     ///
-    /// `video_height` is derived from `input_width`/`input_height` via
-    /// [`CylindricalProjectionConfig::video_height_for_aspect`] rather
-    /// than left at its raw (near-always-wrong) default - see that
-    /// method's docs for why the two must be scaled together.
-    pub fn new(input_width: u32, input_height: u32) -> Self {
-        let mut projection = CylindricalProjectionConfig::default();
-        projection.video_height = CylindricalProjectionConfig::video_height_for_aspect(
-            projection.focal_length,
-            projection.angular_sweep_rad,
-            input_width,
-            input_height,
-        );
+    /// `camera` is rescaled to `input_width`/`input_height` if it was
+    /// calibrated at a different resolution than the video actually
+    /// being processed (same camera, re-encoded/rescaled source file):
+    /// `fx`/`fy`/`cx`/`cy` scale linearly with resolution, while the
+    /// KB4 distortion coefficients are scale-invariant (angles, not
+    /// pixels) and carry over unchanged, mirroring
+    /// `reco_calibrate::lens_database`'s existing profile-rescaling
+    /// logic.
+    pub fn new(camera: CameraParams, input_width: u32, input_height: u32) -> Self {
+        let camera = if camera.width == input_width && camera.height == input_height {
+            camera
+        } else {
+            let scale = input_width as f64 / camera.width as f64;
+            log::info!(
+                "MonoStitchCoreConfig: rescaling calibration {}x{} -> {input_width}x{input_height} (scale={scale:.4})",
+                camera.width,
+                camera.height,
+            );
+            CameraParams {
+                width: input_width,
+                height: input_height,
+                fx: camera.fx * scale,
+                fy: camera.fy * scale,
+                cx: camera.cx * scale,
+                cy: camera.cy * scale,
+                d: camera.d,
+            }
+        };
         Self {
-            projection,
+            camera,
+            max_theta_rad: DEFAULT_MAX_THETA_RAD,
             viewport: ViewportConfig {
                 width: 1920,
                 height: 1080,
@@ -131,9 +160,18 @@ impl MonoStitchCore {
         let output_height = config.viewport.height;
         let fov_degrees = config.viewport.fov_degrees;
 
+        let (yaw_bounds, pitch_bounds) = Self::compute_pose_bounds(
+            &config.camera,
+            config.max_theta_rad,
+            fov_degrees,
+            output_width,
+            output_height,
+        );
+
         let pipeline = MonoPipeline::with_gpu(
             gpu,
-            config.projection,
+            config.camera,
+            config.max_theta_rad,
             config.viewport,
             config.input_width,
             config.input_height,
@@ -142,13 +180,6 @@ impl MonoStitchCore {
         )?;
 
         let readback = RgbaReadback::new(pipeline.gpu(), output_width, output_height)?;
-
-        let (yaw_bounds, pitch_bounds) = Self::compute_pose_bounds(
-            &config.projection,
-            fov_degrees,
-            output_width,
-            output_height,
-        );
 
         Ok(Self {
             pipeline,
@@ -170,12 +201,12 @@ impl MonoStitchCore {
         })
     }
 
-    /// Inset [`cylindrical_panorama_bounds`] by half the output
+    /// Inset [`kb4_mono_panorama_bounds`] by half the output
     /// viewport's angular extent, so a pose clamped to the result keeps
-    /// the *entire rendered frame* inside the painted cylinder region -
-    /// not just its center ray - eliminating the black out-of-coverage
-    /// wedges a pose too close to the edge of the source's angular
-    /// sweep produces.
+    /// the *entire rendered frame* inside the camera's calibrated
+    /// field of view - not just its center ray - eliminating the black
+    /// out-of-coverage wedges a pose too close to the edge of the
+    /// camera's field of view produces.
     ///
     /// Collapses to the midpoint on either axis where the viewport's
     /// own FOV is wider than the available coverage (nothing sensible
@@ -183,24 +214,32 @@ impl MonoStitchCore {
     /// coverage code's "collapse to midpoint if bounds inverted"
     /// fallback).
     fn compute_pose_bounds(
-        projection: &CylindricalProjectionConfig,
+        camera: &CameraParams,
+        max_theta_rad: f32,
         fov_degrees: f32,
         output_width: u32,
         output_height: u32,
     ) -> ((f32, f32), (f32, f32)) {
-        let ((yaw_min, yaw_max), (pitch_min, pitch_max)) = cylindrical_panorama_bounds(projection);
+        let ((yaw_min, yaw_max), (pitch_min, pitch_max)) =
+            kb4_mono_panorama_bounds(camera, max_theta_rad);
 
         let half_v_fov = fov_degrees.to_radians() * 0.5;
         let aspect = output_width as f32 / output_height.max(1) as f32;
         let half_h_fov = (half_v_fov.tan() * aspect).atan();
 
+        // Defense in depth against NaN reaching `resolve_current_pose`'s
+        // `clamp` call (which panics on NaN bounds): `kb4_mono_panorama_bounds`
+        // already guards its own degenerate case, but `lo + hi` below can
+        // still be NaN if `lo`/`hi` were ever +-infinity from some other
+        // caller/future change - fall back to a fixed dead-ahead point
+        // rather than trust an unchecked midpoint.
         let inset = |lo: f32, hi: f32, margin: f32| -> (f32, f32) {
             let (lo, hi) = (lo + margin, hi - margin);
             if lo <= hi {
                 (lo, hi)
             } else {
                 let mid = (lo + hi) * 0.5;
-                (mid, mid)
+                if mid.is_finite() { (mid, mid) } else { (0.0, 0.0) }
             }
         };
         (
@@ -356,21 +395,25 @@ impl MonoStitchCore {
 
     /// Map raw camera-space detections to panorama-space
     /// [`MappedDetection`]s the director can consume, via
-    /// [`cylindrical_to_panorama`] (the mono counterpart of
-    /// [`crate::projection::camera_to_panorama`]).
+    /// [`kb4_mono_to_panorama`] (the mono counterpart of
+    /// [`crate::projection::camera_to_panorama`]). A detection whose
+    /// inverse-KB4 solve doesn't converge (rare - see that function's
+    /// docs) gets `position: None`, which downstream trackers already
+    /// treat as "drop this detection" (e.g. `BallTracker`'s filter
+    /// chain).
     fn map_detections_to_panorama(&self, detections: Vec<Detection>) -> Vec<MappedDetection> {
-        let config = self.pipeline.projection_config();
+        let camera = self.pipeline.camera();
         detections
             .into_iter()
             .map(|d| {
-                let position = cylindrical_to_panorama(d.center_x, d.center_y, config);
+                let position = kb4_mono_to_panorama(d.center_x, d.center_y, camera);
                 MappedDetection {
                     camera: d.camera,
                     class_id: d.class_id,
                     confidence: d.confidence,
                     camera_center: (d.center_x, d.center_y),
                     camera_size: (d.width, d.height),
-                    position: Some(position),
+                    position,
                 }
             })
             .collect()

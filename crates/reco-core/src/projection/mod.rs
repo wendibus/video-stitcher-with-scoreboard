@@ -269,7 +269,7 @@ impl Projection for CylindricalProjection {
 /// call sites, which both use it - keeping it as one named constant
 /// instead of a magic literal in two places prevents them drifting out
 /// of sync.
-pub(crate) const CYLINDRICAL_CAMERA_REST_POSITION: [f32; 3] = [0.0, 0.0, -1.0];
+pub(crate) const MONO_CAMERA_REST_POSITION: [f32; 3] = [0.0, 0.0, -1.0];
 
 /// Map a detection in cylindrical-camera pixel space to the yaw/pitch
 /// needed to center the virtual camera on it.
@@ -303,7 +303,7 @@ pub fn cylindrical_to_panorama(
         config.focal_length * theta.sin(),
     );
     let dir = hit.normalize();
-    direction_to_yaw_pitch(&dir, &CYLINDRICAL_CAMERA_REST_POSITION)
+    direction_to_yaw_pitch(&dir, &MONO_CAMERA_REST_POSITION)
 }
 
 /// Panorama-space (yaw, pitch) bounds, in radians, of the region a
@@ -766,13 +766,152 @@ fn inverse_fisheye(dist_x: f64, dist_y: f64, params: &CameraParams) -> Option<(f
     Some((uv_x, uv_y))
 }
 
+/// Map a detection in a raw KB4 fisheye camera's pixel space to the
+/// yaw/pitch needed to center the mono virtual camera on it - the KB4
+/// counterpart of [`cylindrical_to_panorama`] (replaced by this
+/// function; the cylindrical model was the wrong one for raw,
+/// unstitched camera footage - see `kb4_mono.wgsl`'s module doc).
+///
+/// Inverts the same forward KB4 model [`project_world_point`] and
+/// `kb4_mono.wgsl`'s `fs_kb4_mono` use, via the same Newton-Raphson
+/// solve [`inverse_fisheye`] uses - but reconstructs a full 3D unit
+/// ray from `theta` directly (`sin`/`cos`) instead of `inverse_fisheye`'s
+/// `r = tan(theta)` plane-space form, which is undefined/singular at
+/// theta approaching or exceeding 90 degrees; this mono path's
+/// self-calibration explicitly searches lenses up to 110 degrees
+/// half-FOV, so that limitation would be reached in practice.
+///
+/// `norm_x`/`norm_y` are normalized `[0.0, 1.0]` image coordinates, in
+/// the standard image convention (`[`Detection`]`'s convention, +Y
+/// down from the top). Returns `None` if Newton-Raphson fails to
+/// converge (mirrors [`inverse_fisheye`]).
+pub fn kb4_mono_to_panorama(
+    norm_x: f32,
+    norm_y: f32,
+    camera: &CameraParams,
+) -> Option<ViewportPosition> {
+    let (w, h) = (camera.width as f64, camera.height as f64);
+    let fx = camera.fx / w;
+    let fy = camera.fy / h;
+    let cx = camera.cx / w;
+    let cy = camera.cy / h;
+    let k = camera.d;
+
+    let dx = (norm_x as f64 - cx) / fx;
+    let dy = (norm_y as f64 - cy) / fy;
+    let theta_d = (dx * dx + dy * dy).sqrt();
+
+    let dir_cv = if theta_d < 1e-12 {
+        Vector3::new(0.0, 0.0, 1.0)
+    } else {
+        let mut theta = theta_d;
+        for _ in 0..MAX_ITERATIONS {
+            let f = crate::lens::kb4::theta_d(theta, &k) - theta_d;
+            let f_prime = crate::lens::kb4::theta_d_prime(theta, &k);
+            if f_prime.abs() < 1e-15 {
+                return None;
+            }
+            let delta = f / f_prime;
+            theta -= delta;
+            if delta.abs() < CONVERGENCE_EPS {
+                break;
+            }
+        }
+        if !theta.is_finite() {
+            return None;
+        }
+        let azimuth = dy.atan2(dx);
+        Vector3::new(
+            theta.sin() * azimuth.cos(),
+            theta.sin() * azimuth.sin(),
+            theta.cos(),
+        )
+    };
+
+    // Bridge CV convention (+Y down) to this codebase's graphics
+    // convention (+Y up, same as view_matrix/yaw/pitch everywhere
+    // else) - the exact inverse of the negation `kb4_mono.wgsl`'s
+    // fragment shader applies going the other direction.
+    let dir_graphics = Vector3::new(dir_cv.x as f32, -dir_cv.y as f32, dir_cv.z as f32);
+    Some(direction_to_yaw_pitch(&dir_graphics, &MONO_CAMERA_REST_POSITION))
+}
+
+/// Panorama-space (yaw, pitch) bounds, in radians, of the region a
+/// mono KB4 camera actually has video for - the KB4 counterpart of
+/// [`cylindrical_panorama_bounds`] (see its doc comment for why
+/// border-sampling, not a closed form, is the right approach here
+/// too: the pixel-to-panorama mapping isn't axis-separable).
+///
+/// Samples the source image's border; a border point whose distorted
+/// radius exceeds `max_theta_rad`'s (via the forward KB4 polynomial)
+/// is skipped rather than trusted - the same guard
+/// `kb4_mono.wgsl`'s fragment shader applies, kept consistent here so
+/// the pose clamp this feeds never promises coverage the renderer
+/// would reject.
+pub fn kb4_mono_panorama_bounds(
+    camera: &CameraParams,
+    max_theta_rad: f32,
+) -> ((f32, f32), (f32, f32)) {
+    const SAMPLES: usize = 64;
+    let max_r_d = crate::lens::kb4::theta_d(max_theta_rad as f64, &camera.d);
+
+    let mut yaw_min = f32::INFINITY;
+    let mut yaw_max = f32::NEG_INFINITY;
+    let mut pitch_min = f32::INFINITY;
+    let mut pitch_max = f32::NEG_INFINITY;
+    let mut visit = |norm_x: f32, norm_y: f32| {
+        let (w, h) = (camera.width as f64, camera.height as f64);
+        let dx = (norm_x as f64 - camera.cx / w) / (camera.fx / w);
+        let dy = (norm_y as f64 - camera.cy / h) / (camera.fy / h);
+        if (dx * dx + dy * dy).sqrt() > max_r_d {
+            return;
+        }
+        if let Some(pos) = kb4_mono_to_panorama(norm_x, norm_y, camera) {
+            yaw_min = yaw_min.min(pos.yaw);
+            yaw_max = yaw_max.max(pos.yaw);
+            pitch_min = pitch_min.min(pos.pitch);
+            pitch_max = pitch_max.max(pos.pitch);
+        }
+    };
+    for i in 0..=SAMPLES {
+        let t = i as f32 / SAMPLES as f32;
+        visit(t, 0.0);
+        visit(t, 1.0);
+        visit(0.0, t);
+        visit(1.0, t);
+    }
+
+    // Every sample can fail - e.g. a badly-converged calibration whose
+    // `k` coefficients make `theta_d` non-monotonic (even negative) at
+    // `max_theta_rad`, which makes the `max_r_d` gate above reject
+    // every single border point. Left as the initial +-infinity
+    // sentinels, the caller's "inset by a margin, collapse to midpoint
+    // if inverted" logic computes `infinity + -infinity = NaN` and
+    // corrupts every downstream pose clamp. Degrade to a single safe
+    // point (dead ahead) instead of propagating NaN - a bad
+    // calibration should visibly under-perform, not crash the run.
+    if !yaw_min.is_finite() || !yaw_max.is_finite() || !pitch_min.is_finite() || !pitch_max.is_finite()
+    {
+        log::error!(
+            "kb4_mono_panorama_bounds: no source-image border sample produced a valid \
+             panorama position (camera d={:?}, max_theta_rad={max_theta_rad}) - the \
+             calibration is likely degenerate (e.g. distortion coefficients pinned at a \
+             solver bound). Falling back to a single dead-ahead point instead of crashing; \
+             re-run calibrate-mono.",
+            camera.d
+        );
+        return ((0.0, 0.0), (0.0, 0.0));
+    }
+    ((yaw_min, yaw_max), (pitch_min, pitch_max))
+}
+
 /// Project a 3D world point through a posed KB4 fisheye camera to a
 /// normalized `[0,1]` pixel coordinate.
 ///
 /// Standard Kannala-Brandt equidistant-fisheye projection: `pose`
 /// transforms world -> camera-local coordinates (camera looks down
 /// `+Z`, matching every other camera convention in this module -
-/// see [`CYLINDRICAL_CAMERA_REST_POSITION`]'s doc comment). Works
+/// see [`MONO_CAMERA_REST_POSITION`]'s doc comment). Works
 /// directly on the ray's `(x, y, z)` via `atan2`, unlike
 /// [`forward_fisheye`]/[`kb4_forward_scale`](crate::lens::kb4_forward_scale)'s
 /// `r = tan(theta)` plane-UV convention, which is only valid for
@@ -1223,6 +1362,102 @@ mod tests {
         assert!(project_world_point(&pose, &world_point, &params, 1.0).is_none());
         assert!(
             project_world_point(&pose, &world_point, &params, std::f64::consts::PI).is_some()
+        );
+    }
+
+    #[test]
+    fn kb4_mono_to_panorama_roundtrips_with_project_world_point() {
+        // Validates both directions of the CV-Y-down <-> graphics-Y-up
+        // bridge at once: forward-project a known ray via
+        // `project_world_point` (pure CV convention, no bridging),
+        // invert the resulting pixel via `kb4_mono_to_panorama` (which
+        // DOES bridge), and check the result matches
+        // `direction_to_yaw_pitch` applied directly to the same ray's
+        // graphics-convention form (y negated).
+        let camera = CameraParams {
+            width: 1920,
+            height: 1080,
+            fx: 800.0,
+            fy: 800.0,
+            cx: 960.0,
+            cy: 540.0,
+            d: [0.02, -0.01, 0.0, 0.0],
+        };
+        let pose = nalgebra::Isometry3::identity();
+
+        for &(theta_deg, azimuth_deg) in &[
+            (0.0_f64, 0.0_f64),
+            (20.0, 0.0),
+            (20.0, 90.0),
+            (30.0, 180.0),
+            (15.0, 270.0),
+        ] {
+            let theta = theta_deg.to_radians();
+            let az = azimuth_deg.to_radians();
+            let dir_cv = (
+                theta.sin() * az.cos(),
+                theta.sin() * az.sin(),
+                theta.cos(),
+            );
+            let world_point = Point3::new(dir_cv.0 * 5.0, dir_cv.1 * 5.0, dir_cv.2 * 5.0);
+            let (px, py) = project_world_point(&pose, &world_point, &camera, std::f64::consts::PI)
+                .expect("forward projection should succeed for a moderate angle");
+            let pos = kb4_mono_to_panorama(px as f32, py as f32, &camera)
+                .expect("inverse should converge");
+
+            let dir_graphics = Vector3::new(dir_cv.0 as f32, -dir_cv.1 as f32, dir_cv.2 as f32);
+            let expected = direction_to_yaw_pitch(&dir_graphics, &MONO_CAMERA_REST_POSITION);
+            assert!(
+                (pos.yaw - expected.yaw).abs() < 1e-3,
+                "theta={theta_deg} az={azimuth_deg}: yaw {} != expected {}",
+                pos.yaw,
+                expected.yaw
+            );
+            assert!(
+                (pos.pitch - expected.pitch).abs() < 1e-3,
+                "theta={theta_deg} az={azimuth_deg}: pitch {} != expected {}",
+                pos.pitch,
+                expected.pitch
+            );
+        }
+    }
+
+    #[test]
+    fn kb4_mono_panorama_bounds_are_symmetric_and_nonempty() {
+        let camera = CameraParams {
+            width: 1920,
+            height: 1080,
+            fx: 800.0,
+            fy: 800.0,
+            cx: 960.0,
+            cy: 540.0,
+            d: [0.0, 0.0, 0.0, 0.0],
+        };
+        let ((yaw_min, yaw_max), (pitch_min, pitch_max)) =
+            kb4_mono_panorama_bounds(&camera, std::f32::consts::PI * 0.75);
+
+        assert!(yaw_min < 0.0 && yaw_max > 0.0, "yaw range must straddle center");
+        assert!((yaw_min + yaw_max).abs() < 1e-2, "yaw bounds roughly symmetric");
+        assert!(pitch_min < 0.0 && pitch_max > 0.0);
+        assert!((pitch_min + pitch_max).abs() < 1e-2);
+    }
+
+    #[test]
+    fn kb4_mono_panorama_bounds_shrink_with_tighter_max_theta() {
+        let camera = CameraParams {
+            width: 1920,
+            height: 1080,
+            fx: 800.0,
+            fy: 800.0,
+            cx: 960.0,
+            cy: 540.0,
+            d: [0.0, 0.0, 0.0, 0.0],
+        };
+        let (wide_yaw, _) = kb4_mono_panorama_bounds(&camera, std::f32::consts::PI * 0.75);
+        let (tight_yaw, _) = kb4_mono_panorama_bounds(&camera, 0.2);
+        assert!(
+            tight_yaw.1 - tight_yaw.0 < wide_yaw.1 - wide_yaw.0,
+            "a tighter max_theta must not produce a wider or equal envelope"
         );
     }
 

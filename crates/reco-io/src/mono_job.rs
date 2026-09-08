@@ -1,4 +1,4 @@
-//! One-shot file-to-file mono (single-camera, cylindrical projection)
+//! One-shot file-to-file mono (single-camera, KB4 fisheye projection)
 //! stitching (Layer 3 API) - mirrors [`crate::stitch_job::StitchJob`]
 //! for [`reco_core::core::mono::MonoStitchCore`] instead of
 //! [`reco_core::session::StitchSession`].
@@ -11,13 +11,23 @@
 //! that path exists for live-camera capture, which mono doesn't serve
 //! yet.
 //!
+//! Unlike [`StitchJob`](crate::stitch_job::StitchJob), this takes the
+//! camera calibration as an in-memory [`CameraParams`] rather than a
+//! JSON file path: the mono calibration file format
+//! (`reco calibrate-mono`'s output) is a `reco-calibrate` concern, and
+//! `reco-io` can't depend on `reco-calibrate` (which already depends
+//! on `reco-io`) - so parsing that file lives in `reco-cli`, which
+//! depends on both.
+//!
 //! # Example
 //!
 //! ```rust,ignore
 //! use reco_io::MonoJob;
 //! use reco_io::output::{Codec, Quality};
+//! use reco_core::calibration::CameraParams;
 //!
-//! MonoJob::new("wide.mp4", "output.mp4")
+//! let camera: CameraParams = /* loaded from `reco calibrate-mono`'s output */;
+//! MonoJob::new("wide.mp4", "output.mp4", camera)
 //!     .codec(Codec::HEVC)
 //!     .quality(Quality::High)
 //!     .on_session(|core, fps| {
@@ -29,6 +39,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use reco_core::calibration::CameraParams;
 use reco_core::core::mono::{MonoStitchCore, MonoStitchCoreConfig};
 use reco_core::core::types::RenderOutcome;
 use reco_core::render::planes::YuvPlanes;
@@ -66,6 +77,10 @@ pub struct MonoJobResult {
 pub struct MonoJob {
     input: PathBuf,
     output: PathBuf,
+    camera: CameraParams,
+    max_theta_rad: f32,
+    rig_tilt: f32,
+    rig_roll: f32,
 
     codec: Codec,
     bitrate: Bitrate,
@@ -84,10 +99,20 @@ pub struct MonoJob {
 
 impl MonoJob {
     /// New job with required fields only; defaults everywhere else.
-    pub fn new(input: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
+    ///
+    /// `camera` is this camera's calibrated KB4 fisheye intrinsics
+    /// (from `reco calibrate-mono`'s output) - rescaled automatically
+    /// to the source video's actual resolution if it differs from the
+    /// resolution the calibration frame was extracted at, see
+    /// [`MonoStitchCoreConfig::new`].
+    pub fn new(input: impl Into<PathBuf>, output: impl Into<PathBuf>, camera: CameraParams) -> Self {
         Self {
             input: input.into(),
             output: output.into(),
+            camera,
+            max_theta_rad: reco_core::core::mono::DEFAULT_MAX_THETA_RAD,
+            rig_tilt: 0.0,
+            rig_roll: 0.0,
             codec: Codec::default(),
             bitrate: Bitrate::default(),
             format: Format::default(),
@@ -99,6 +124,25 @@ impl MonoJob {
             detection_interval: 1,
             session_hook: None,
         }
+    }
+
+    /// Override the max angle (radians) from the optical axis this
+    /// calibration is trusted for. Defaults to
+    /// [`reco_core::core::mono::DEFAULT_MAX_THETA_RAD`].
+    pub fn max_theta_rad(mut self, radians: f32) -> Self {
+        self.max_theta_rad = radians;
+        self
+    }
+
+    /// Rig tilt/roll correction (radians) for a physically un-level
+    /// mount - same convention as the stereo path's `view_matrix`.
+    /// Defaults to `(0.0, 0.0)`; a future calibration-derived default
+    /// (from the solved camera pose) is a planned follow-up, not yet
+    /// wired in - see `MonoStitchCoreConfig`'s module docs.
+    pub fn rig_tilt_roll(mut self, tilt: f32, roll: f32) -> Self {
+        self.rig_tilt = tilt;
+        self.rig_roll = roll;
+        self
     }
 
     /// Output video codec.
@@ -172,9 +216,12 @@ impl MonoJob {
         let (out_w, out_h) = self.resolution.unwrap_or((1920, 1080));
 
         let gpu = reco_core::gpu::GpuContext::new_blocking()?;
-        let mut config = MonoStitchCoreConfig::new(input_width, input_height);
+        let mut config = MonoStitchCoreConfig::new(self.camera, input_width, input_height);
+        config.max_theta_rad = self.max_theta_rad;
         config.viewport.width = out_w;
         config.viewport.height = out_h;
+        config.viewport.rig_tilt = self.rig_tilt;
+        config.viewport.rig_roll = self.rig_roll;
         config.input_format = InputFormat::Yuv420p;
         let mut core = MonoStitchCore::new(gpu, config)?;
 

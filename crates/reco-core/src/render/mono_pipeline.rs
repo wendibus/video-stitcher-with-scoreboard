@@ -1,13 +1,14 @@
-//! Single-input cylindrical stitch pipeline.
+//! Single-input KB4 fisheye stitch pipeline.
 //!
-//! Mirrors [`super::pipeline::StitchPipeline`] but for one camera and
-//! [`CylindricalProjectionConfig`] instead of [`MatchCalibration`] +
-//! `SceneGeometry` - see [`crate::projection::CylindricalProjection`]'s
-//! module docs for why this is a separate type rather than an `Option`
-//! threaded through `StitchPipeline`: the two pipelines share almost no
-//! GPU state (one camera plane vs. two, a raycasting shader vs. a
-//! textured-quad one), so keeping them apart avoids `Option`-checking
-//! every stereo-only field on every call.
+//! Mirrors [`super::pipeline::StitchPipeline`] but for one raw,
+//! uncorrected fisheye camera and [`CameraParams`] instead of
+//! [`MatchCalibration`] + `SceneGeometry` - see
+//! [`crate::projection::project_world_point`]'s module docs for the
+//! projection this renders. Kept as a separate type rather than an
+//! `Option` threaded through `StitchPipeline`: the two pipelines share
+//! almost no GPU state (one camera plane vs. two, a raycasting shader
+//! vs. a textured-quad one), so keeping them apart avoids
+//! `Option`-checking every stereo-only field on every call.
 //!
 //! Used by [`crate::core::mono::MonoStitchCore`] the same way
 //! `StitchPipeline` is used by [`crate::core::StitchCore`].
@@ -17,18 +18,20 @@ use super::pipeline::PipelineError;
 use super::planes::YuvPlanes;
 use super::renderer::InputFormat;
 use super::viewport::ViewportConfig;
-use crate::calibration::MAX_DIM;
+use crate::calibration::{CameraParams, MAX_DIM};
 use crate::gpu::GpuContext;
-use crate::projection::CylindricalProjectionConfig;
 
-/// The single-input cylindrical stitch pipeline.
+/// The single-input KB4 fisheye stitch pipeline.
 ///
-/// Owns the GPU context, the cylindrical projection config, and the
-/// [`MonoRenderer`]. Consumers provide YUV420P frames and receive a
-/// rendered RGBA command buffer via [`Self::render_to_target`].
+/// Owns the GPU context, the camera's calibrated KB4 intrinsics, and
+/// the [`MonoRenderer`]. Consumers provide YUV420P frames and receive
+/// a rendered RGBA command buffer via [`Self::render_to_target`].
 pub struct MonoPipeline {
     gpu: GpuContext,
-    config: CylindricalProjectionConfig,
+    camera: CameraParams,
+    /// Max angle (radians) from the optical axis this calibration is
+    /// trusted for - see `kb4_mono.wgsl`'s doc comment.
+    max_theta_rad: f32,
     viewport: ViewportConfig,
     renderer: MonoRenderer,
     input_width: u32,
@@ -39,7 +42,8 @@ impl MonoPipeline {
     /// Create a mono pipeline with an existing GPU context.
     pub fn with_gpu(
         gpu: GpuContext,
-        config: CylindricalProjectionConfig,
+        camera: CameraParams,
+        max_theta_rad: f32,
         viewport: ViewportConfig,
         input_width: u32,
         input_height: u32,
@@ -74,16 +78,19 @@ impl MonoPipeline {
         );
 
         log::info!(
-            "Mono pipeline initialized: {}x{} output, GPU: {}, sweep={:.0}deg",
+            "Mono pipeline initialized: {}x{} output, GPU: {}, fx={:.0} fy={:.0} max_theta={:.0}deg",
             viewport.width,
             viewport.height,
             gpu.adapter_info.name,
-            config.angular_sweep_rad.to_degrees(),
+            camera.fx,
+            camera.fy,
+            max_theta_rad.to_degrees(),
         );
 
         Ok(Self {
             gpu,
-            config,
+            camera,
+            max_theta_rad,
             viewport,
             renderer,
             input_width,
@@ -101,9 +108,10 @@ impl MonoPipeline {
         &self.gpu
     }
 
-    /// The cylindrical projection config this pipeline was created with.
-    pub fn projection_config(&self) -> &CylindricalProjectionConfig {
-        &self.config
+    /// The calibrated KB4 camera intrinsics this pipeline was created
+    /// with.
+    pub fn camera(&self) -> &CameraParams {
+        &self.camera
     }
 
     /// The current output viewport configuration.
@@ -133,7 +141,8 @@ impl MonoPipeline {
             .upload_yuv(&self.gpu, frame.y, frame.u, frame.v)?;
         Ok(self.renderer.render_to_target(
             &self.gpu,
-            &self.config,
+            &self.camera,
+            self.max_theta_rad,
             yaw,
             pitch,
             self.viewport.rig_tilt,

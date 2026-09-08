@@ -41,7 +41,7 @@ pub struct PointCorrespondence {
 }
 
 /// Result of a successful mono calibration solve.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MonoCalibrationResult {
     pub camera: CameraParams,
     /// Solved world -> camera rotation, axis-angle radians.

@@ -288,6 +288,12 @@ enum Commands {
         /// Path to the source video file.
         input: String,
 
+        /// Path to a calibration file from `reco calibrate-mono` -
+        /// the KB4 fisheye undistortion this renders with needs the
+        /// camera's own calibrated intrinsics.
+        #[arg(long)]
+        calibration: String,
+
         /// Output file path.
         #[arg(short, long, default_value = "output.mp4")]
         output: String,
@@ -747,6 +753,19 @@ enum Commands {
         #[arg(long)]
         points: Option<String>,
 
+        /// Skip the browser round-trip and instead ask a local Ollama
+        /// vision-language model (e.g. "qwen2.5vl:32b") to locate the
+        /// court points itself. The frame goes only to the local
+        /// Ollama endpoint - nothing leaves the machine. Unverified by
+        /// this process (never views the frame itself) - spot-check
+        /// the printed points and the reprojection error.
+        #[arg(long)]
+        auto_model: Option<String>,
+
+        /// Ollama server URL for --auto-model.
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_endpoint: String,
+
         /// Max Nelder-Mead iterations per multi-start run.
         #[arg(long, default_value_t = 800)]
         max_iters: u64,
@@ -920,6 +939,7 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Mono {
             input,
+            calibration,
             output,
             width,
             height,
@@ -939,6 +959,7 @@ fn main() -> anyhow::Result<()> {
             mono::MonoArgs {
                 input: &input,
                 output: &output,
+                calibration: &calibration,
                 width,
                 height,
                 encoder_name: encoder,
@@ -1213,12 +1234,16 @@ fn main() -> anyhow::Result<()> {
             video,
             frame_time,
             points,
+            auto_model,
+            ollama_endpoint,
             max_iters,
             output,
         } => calibrate_mono::run_calibrate_mono(
             &video,
             frame_time,
             points.as_deref(),
+            auto_model.as_deref(),
+            &ollama_endpoint,
             max_iters,
             &output,
         ),
