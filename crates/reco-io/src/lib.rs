@@ -36,6 +36,9 @@ pub mod output;
 pub mod smart_source;
 
 #[cfg(feature = "ffmpeg")]
+pub mod mono_job;
+
+#[cfg(feature = "ffmpeg")]
 pub mod stitch_job;
 
 #[cfg(feature = "ffmpeg")]
@@ -57,6 +60,9 @@ pub mod stacked_video;
 
 #[cfg(feature = "ffmpeg")]
 pub use smart_source::SmartFileSource;
+
+#[cfg(feature = "ffmpeg")]
+pub use mono_job::{MonoJob, MonoJobError, MonoJobResult};
 
 #[cfg(feature = "ffmpeg")]
 pub use stitch_job::{InputPath, StitchJob, StitchResult};

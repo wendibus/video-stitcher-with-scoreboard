@@ -37,6 +37,7 @@
 //! - `replay_management` - stacked replay recorder wiring (CPU + GPU paths)
 //! - `pose` - pose resolution, detection scheduling, panorama mapping
 
+pub mod mono;
 mod pose;
 mod render;
 pub mod replay_buffer;
@@ -517,8 +518,8 @@ impl crate::detect::DetectionTarget for StitchCore {
     fn set_panner(&mut self, panner: Box<dyn crate::detect::panner::Panner>) {
         self.set_panner(panner);
     }
-    fn pipeline(&self) -> &crate::render::pipeline::StitchPipeline {
-        self.pipeline()
+    fn source_info(&self) -> (u32, u32) {
+        self.pipeline().source_info()
     }
     fn gpu(&self) -> &crate::gpu::GpuContext {
         self.gpu()

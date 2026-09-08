@@ -57,6 +57,7 @@ clap = { version = "4", features = ["derive"] }
 # bug-report logs have a single structured source of truth.
 log = "0.4"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pollster = "0.4"
 winit = "0.30"
@@ -66,3 +67,8 @@ tracing-log = { workspace = true }
 tracing-chrome = { version = "0.7", optional = true }
 ctrlc = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Opens the court-calibration point-picking HTML tool in the default
+# browser (`reco calibrate-mono`) - same version already used by
+# reco-gui for the equivalent roi_editor.html round-trip.
+open = "5"
+base64 = "0.22"

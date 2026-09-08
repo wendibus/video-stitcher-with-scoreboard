@@ -330,6 +330,53 @@ fn default_blend_width() -> f32 {
 const MAX_CALIBRATION_FILE_SIZE: u64 = 1_048_576;
 
 impl MatchCalibration {
+    /// A structurally-valid but semantically-meaningless calibration,
+    /// for APIs that require a `&MatchCalibration` but never read one
+    /// for the caller's actual camera setup.
+    ///
+    /// [`crate::core::mono::MonoStitchCore`] has no stereo calibration
+    /// at all (one camera, no L-shape plane geometry) - but
+    /// [`crate::detect::panner::DispatchContext`] structurally
+    /// requires one for panners that might project between camera and
+    /// panorama space. Today's shipping panners
+    /// ([`FieldPanner`](https://docs.rs/reco-autocam/latest/reco_autocam/panners/struct.FieldPanner.html))
+    /// never read `ctx.calibration` (they work purely in yaw/pitch
+    /// `WorldState` space), so any valid value satisfies the contract.
+    /// This passes [`Self::validate`] (unlike an all-zero struct,
+    /// which would fail it) so a future panner that *does* read
+    /// calibration fails loudly on first use instead of silently
+    /// misbehaving on this value.
+    pub fn mono_placeholder() -> Self {
+        let camera = CameraParams {
+            width: 1920,
+            height: 1080,
+            fx: 900.0,
+            fy: 900.0,
+            cx: 960.0,
+            cy: 540.0,
+            d: [0.0; 4],
+        };
+        Self {
+            left: camera.clone(),
+            right: camera,
+            layout: PlaneLayout {
+                camera_axis_offset: 0.24,
+                intersect: 0.54,
+                x_ty: 0.0,
+                x_rz: 0.0,
+                z_rx: 0.0,
+                x_rx: 0.0,
+                z_rz: 0.0,
+            },
+            rig_tilt: 0.0,
+            rig_roll: 0.0,
+            sync_offset: 0,
+            field_roi: None,
+            lens_correction_amount: 1.0,
+            blend_width: 0.05,
+        }
+    }
+
     /// Load and validate a calibration from a JSON file.
     ///
     /// Checks file size (max 1 MB), parses JSON, and runs

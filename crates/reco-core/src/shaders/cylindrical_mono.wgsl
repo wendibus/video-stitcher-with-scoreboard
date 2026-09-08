@@ -48,18 +48,62 @@ struct CylUniforms {
     v_fov: f32,
     // Viewport aspect ratio (output_width / output_height).
     aspect: f32,
-    // Padding for std140 alignment.
+    // 1.0 when the source plane(s) are NV12 (interleaved UV in t_u);
+    // 0.0 for YUV420P (separate t_u/t_v). Mirrors `fisheye.wgsl`'s
+    // `flags.y` format switch, minus the BGRA/zero-copy variants that
+    // path supports - mono only serves CPU-decoded file input today.
+    is_nv12: f32,
+    // Padding for std140 alignment (mat4x4 + 8 f32 = 96 bytes, 16-aligned).
     _pad0: f32,
-    _pad1: f32,
 };
 
-@group(0) @binding(0) var<uniform> u: CylUniforms;
-@group(0) @binding(1) var video_tex: texture_2d<f32>;
-@group(0) @binding(2) var video_samp: sampler;
+// YUV420P plane textures (Y = full res R8Unorm, U/V = half res R8Unorm),
+// or NV12 (t_y = R8Unorm, t_u = interleaved Rg8Unorm, t_v unused dummy) -
+// same texture-plane convention as `fisheye.wgsl`, so the Rust-side bind
+// group layout and upload helpers are directly shared.
+@group(0) @binding(0) var t_y: texture_2d<f32>;
+@group(0) @binding(1) var t_u: texture_2d<f32>;
+@group(0) @binding(2) var t_v: texture_2d<f32>;
+@group(0) @binding(3) var s_video: sampler;
+@group(1) @binding(0) var<uniform> u: CylUniforms;
+
+// BT.709 limited-range (16-235/16-240) YCbCr -> full-range sRGB RGB.
+// Same matrix and range convention as `fisheye.wgsl`'s `sample_yuv`,
+// so mono and stereo output match visually. NV12 vs YUV420P selection
+// only (no BGRA/zero-copy variant - mono only serves CPU-decoded file
+// input today, see the module doc comment in `projection/mod.rs`).
+fn sample_yuv(uv: vec2<f32>) -> vec3<f32> {
+    let y_raw = textureSample(t_y, s_video, uv).r;
+    var u_raw: f32;
+    var v_raw: f32;
+    if u.is_nv12 > 0.5 {
+        let uv_sample = textureSample(t_u, s_video, uv);
+        u_raw = uv_sample.r;
+        v_raw = uv_sample.g;
+    } else {
+        u_raw = textureSample(t_u, s_video, uv).r;
+        v_raw = textureSample(t_v, s_video, uv).r;
+    }
+    let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
+    let cb = (u_raw - 128.0 / 255.0) * (255.0 / 224.0);
+    let cr = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
+    let r = y + 1.5748 * cr;
+    let g = y - 0.1873 * cb - 0.4681 * cr;
+    let b = y + 1.8556 * cb;
+    return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    // True clip-space NDC (-1..+1, Y-up), carried through unchanged for
+    // per-pixel ray construction below. NOT a texture UV - this shader
+    // never samples the video texture at a rasterizer-interpolated
+    // coordinate (that happens via theta_norm/v_norm instead), so there
+    // is no video-texture "V=0 at top" convention to bake in here. An
+    // earlier version emitted such a texture-convention UV and reused
+    // it as if it were NDC, which silently flipped ray.y's sign and
+    // rendered the output upside-down.
+    @location(0) ndc: vec2<f32>,
 };
 
 // Full-screen triangle vertex shader (no vertex buffer needed; dispatch
@@ -71,21 +115,16 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
         vec2<f32>( 3.0, -1.0),
         vec2<f32>(-1.0,  3.0),
     );
-    var uvs = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(2.0, 1.0),
-        vec2<f32>(0.0, -1.0),
-    );
     var out: VsOut;
     out.pos = vec4<f32>(positions[vid], 0.0, 1.0);
-    out.uv = uvs[vid];
+    out.ndc = positions[vid];
     return out;
 }
 
 @fragment
 fn fs_cylindrical_mono(in: VsOut) -> @location(0) vec4<f32> {
-    // Step 1: viewport UV -> normalized device coordinates (-1..+1).
-    let ndc = in.uv * 2.0 - vec2<f32>(1.0, 1.0);
+    // Step 1: already true NDC (-1..+1) - see VsOut::ndc's doc comment.
+    let ndc = in.ndc;
 
     // Step 2: build a ray in view space from the camera at the origin.
     // Horizontal FOV derived from aspect.
@@ -128,8 +167,8 @@ fn fs_cylindrical_mono(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // Step 6: sample the video texture. Flip v so (0,0) is top-left
-    // as is conventional for video textures.
+    // Step 6: sample the video planes. Flip v so (0,0) is top-left as
+    // is conventional for video textures.
     let uv_sample = vec2<f32>(theta_norm, 1.0 - v_norm);
-    return textureSample(video_tex, video_samp, uv_sample);
+    return vec4<f32>(sample_yuv(uv_sample), 1.0);
 }

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Reco - Court Calibration Editor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a1a; color: #ddd; font-family: system-ui, sans-serif; }
+.header { padding: 12px 20px; background: #222; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.header h1 { font-size: 16px; font-weight: 600; }
+.header button { padding: 6px 12px; border-radius: 4px; border: 1px solid #444; background: #333; color: #ddd; font-size: 13px; cursor: pointer; }
+.header button.primary { background: #4a7a4a; border-color: #5a9a5a; }
+.header button:hover { background: #444; }
+.header button.primary:hover { background: #5a8a5a; }
+.header .spacer { flex: 1; }
+.header .info { color: #888; font-size: 12px; }
+.target { padding: 10px 20px; background: #2a3a4a; font-size: 15px; font-weight: 600; color: #9cf; }
+.target .done { color: #8f8; }
+.canvas-wrap { position: relative; display: flex; justify-content: center; padding: 5px; overflow: hidden; height: calc(100vh - 100px); }
+canvas { cursor: crosshair; max-width: 100%; max-height: 100%; object-fit: contain; }
+.instructions { position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%); background: #333a; padding: 6px 14px; border-radius: 6px; font-size: 11px; color: #aaa; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Court Calibration Editor</h1>
+  <button onclick="undo()">Undo</button>
+  <button onclick="skip()">Skip (not visible)</button>
+  <span class="spacer"></span>
+  <span class="info" id="pointCount">0 points</span>
+  <button class="primary" onclick="saveAndClose()">Save Points</button>
+</div>
+
+<div class="target" id="target"></div>
+
+<div class="canvas-wrap">
+  <canvas id="canvas"></canvas>
+</div>
+
+<div class="instructions">
+  Click the court where the labeled point above is. Skip it if not visible in frame. Undo reverts the last click/skip.
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const pointCountEl = document.getElementById('pointCount');
+const targetEl = document.getElementById('target');
+
+// Data injected by Rust at generation time.
+const IMAGE_DATA = '{{IMAGE_DATA}}';
+const IMAGE_WIDTH = {{IMAGE_WIDTH}};
+const IMAGE_HEIGHT = {{IMAGE_HEIGHT}};
+const POINT_LABELS = {{POINT_LABELS_JSON}};
+
+let image = null;
+// history[i] is either {label, x, y} (clicked) or {label, skipped: true}.
+const history = [];
+
+function loadImage(dataUri) {
+  return new Promise((resolve, reject) => {
+    if (!dataUri || dataUri.startsWith('{{')) { reject('no data'); return; }
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = dataUri;
+  });
+}
+
+async function init() {
+  try { image = await loadImage(IMAGE_DATA); } catch (e) { console.warn('image not available', e); }
+  canvas.width = image ? image.naturalWidth : IMAGE_WIDTH;
+  canvas.height = image ? image.naturalHeight : IMAGE_HEIGHT;
+  redraw();
+}
+
+function currentLabel() {
+  return history.length < POINT_LABELS.length ? POINT_LABELS[history.length] : null;
+}
+
+function updateTarget() {
+  const label = currentLabel();
+  if (label) {
+    targetEl.textContent = `Click: ${label}  (${history.length + 1} / ${POINT_LABELS.length})`;
+    targetEl.classList.remove('done');
+  } else {
+    targetEl.innerHTML = '<span class="done">All points done - click "Save Points".</span>';
+  }
+}
+
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (image) {
+    ctx.drawImage(image, 0, 0);
+  } else {
+    ctx.fillStyle = '#333';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#888';
+    ctx.font = '20px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('No image loaded', canvas.width / 2, canvas.height / 2);
+  }
+
+  const w = canvas.width;
+  const h = canvas.height;
+  for (const entry of history) {
+    if (entry.skipped) continue;
+    const x = entry.x * w;
+    const y = entry.y * h;
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#0f0';
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px system-ui';
+    ctx.fillText(entry.label, x + 8, y - 6);
+  }
+
+  const clicked = history.filter(e => !e.skipped).length;
+  pointCountEl.textContent = `${clicked} / ${POINT_LABELS.length} points clicked`;
+  updateTarget();
+}
+
+canvas.addEventListener('click', (e) => {
+  const label = currentLabel();
+  if (!label) return;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const x = (e.clientX - rect.left) * scaleX / canvas.width;
+  const y = (e.clientY - rect.top) * scaleY / canvas.height;
+  history.push({ label, x: Math.round(x * 10000) / 10000, y: Math.round(y * 10000) / 10000 });
+  redraw();
+});
+
+function undo() {
+  history.pop();
+  redraw();
+}
+
+function skip() {
+  const label = currentLabel();
+  if (!label) return;
+  history.push({ label, skipped: true });
+  redraw();
+}
+
+function saveAndClose() {
+  const points = history.filter(e => !e.skipped).map(e => ({ label: e.label, x: e.x, y: e.y }));
+  const payload = { width: canvas.width, height: canvas.height, points };
+  const json = JSON.stringify(payload, null, 2);
+
+  try {
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'court_points.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    pointCountEl.textContent = 'Downloaded court_points.json - paste its path (or the raw JSON) back into the terminal.';
+    pointCountEl.style.color = '#8f8';
+  } catch (e) {
+    showManualCopy(json);
+  }
+}
+
+function showManualCopy(json) {
+  const wrap = document.querySelector('.canvas-wrap');
+  wrap.innerHTML = '<textarea id="pointsText" style="width:90%;height:300px;background:#222;color:#ddd;font-family:monospace;font-size:12px;padding:10px;border:1px solid #555;border-radius:6px;">' + json + '</textarea>';
+  document.getElementById('pointsText').select();
+  pointCountEl.textContent = 'Download failed. Select all (Ctrl+A), copy (Ctrl+C), then paste the JSON into the terminal.';
+  pointCountEl.style.color = '#ff8';
+}
+
+init();
+</script>
+</body>
+</html>

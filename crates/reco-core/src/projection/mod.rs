@@ -152,9 +152,15 @@ pub struct CylindricalProjectionConfig {
     /// exposes this as a ±30-degree slider labelled "Screen tilt" and
     /// uses it to correct for a rig that is not level side-to-side.
     pub screen_rotation_rad: f32,
-    /// Video height in world units. Defaults to `1.0` (normalized);
-    /// consumers with a known camera height can pass the actual value
-    /// so the cylinder has the right aspect.
+    /// Video height in world units, on the *same* scale as
+    /// `focal_length` - NOT independently normalized. The bare
+    /// default (`1.0`) only makes sense paired with a tiny
+    /// `focal_length`; for the real default `focal_length = 2400.0`
+    /// it is almost always wrong (the painted patch collapses to a
+    /// sliver, and pitch resolution goes to ~0). Callers that know the
+    /// source video's pixel dimensions should compute this via
+    /// [`CylindricalProjectionConfig::video_height_for_aspect`]
+    /// instead of leaving the default in place.
     pub video_height: f32,
 }
 
@@ -185,6 +191,33 @@ pub struct CylindricalProjection {
     /// Projection parameters. `Default` uses `actionstitch`-matching
     /// values (see [`CylindricalProjectionConfig::default`]).
     pub config: CylindricalProjectionConfig,
+}
+
+impl CylindricalProjectionConfig {
+    /// The `video_height` (world units) that paints the source video
+    /// onto the cylinder without vertical stretch/squash, given its
+    /// pixel aspect ratio.
+    ///
+    /// The painted patch's horizontal extent (arc length at radius
+    /// `focal_length`, swept through `angular_sweep_rad`) is
+    /// `focal_length * angular_sweep_rad`. Scaling `video_height` to
+    /// match that arc length times the source's height/width ratio
+    /// keeps the two axes in the same world-unit scale - `focal_length`
+    /// and the bare default `video_height = 1.0` are not automatically
+    /// consistent (see [`Self::default`]'s doc comment), so a caller
+    /// that knows the source dimensions should always compute this
+    /// instead of leaving `video_height` at its placeholder default.
+    /// [`crate::core::mono::MonoStitchCoreConfig::new`] does exactly
+    /// that.
+    pub fn video_height_for_aspect(
+        focal_length: f32,
+        angular_sweep_rad: f32,
+        input_width: u32,
+        input_height: u32,
+    ) -> f32 {
+        let arc_length = focal_length * angular_sweep_rad;
+        arc_length * (input_height as f32 / input_width as f32)
+    }
 }
 
 impl CylindricalProjection {
@@ -218,6 +251,101 @@ impl Projection for CylindricalProjection {
     fn wgsl_composite_source(&self) -> &str {
         CYLINDRICAL_MONO_WGSL
     }
+}
+
+/// Stand-in "camera position" for [`VirtualCamera`] basis construction
+/// on the cylindrical/mono path.
+///
+/// The cylindrical camera genuinely sits at the world origin (on the
+/// cylinder axis) - but [`VirtualCamera::new`] derives its rest-forward
+/// direction as `(-eye).normalize()`, which is `(0,0,0).normalize()`
+/// (NaN) for an eye exactly at the origin. That convention exists for
+/// the L-shape path, where cameras are positioned away from the origin
+/// and look inward at it; the cylindrical camera has no such "look at
+/// the origin" relationship; It only needs *some* fixed, non-degenerate
+/// rest-forward direction to decompose yaw/pitch against. `[0,0,-1]`
+/// picks rest-forward `= (0,0,1)`, matching this module's
+/// `cylindrical_to_panorama`/[`super::mono_renderer`]'s `view_matrix`
+/// call sites, which both use it - keeping it as one named constant
+/// instead of a magic literal in two places prevents them drifting out
+/// of sync.
+pub(crate) const CYLINDRICAL_CAMERA_REST_POSITION: [f32; 3] = [0.0, 0.0, -1.0];
+
+/// Map a detection in cylindrical-camera pixel space to the yaw/pitch
+/// needed to center the virtual camera on it.
+///
+/// Exact inverse of `cylindrical_mono.wgsl`'s `fs_cylindrical_mono`
+/// forward sampling (video UV -> cylinder hit -> ray): given a
+/// normalized detection center, reconstruct the cylinder hit point and
+/// decompose the camera-at-origin direction to it into yaw/pitch via
+/// [`direction_to_yaw_pitch`] - the same basis every other panorama
+/// consumer (panners, directors, [`camera_to_panorama`]) shares, just
+/// with the camera pinned to the cylinder axis (`[0,0,0]`) instead of
+/// an L-shape plane's calibrated position.
+///
+/// `norm_x`/`norm_y` are in normalized `[0.0, 1.0]` image coordinates
+/// (as returned by [`Detection`](crate::detect::detector::Detection)).
+pub fn cylindrical_to_panorama(
+    norm_x: f32,
+    norm_y: f32,
+    config: &CylindricalProjectionConfig,
+) -> ViewportPosition {
+    let theta_norm = norm_x;
+    let v_norm = 1.0 - norm_y;
+    let half_sweep = config.angular_sweep_rad * 0.5;
+    let theta_start = std::f32::consts::FRAC_PI_2 - half_sweep;
+    let theta = theta_start + theta_norm * config.angular_sweep_rad;
+    let y_world = v_norm * config.video_height - config.video_height * 0.5;
+
+    let hit = Vector3::new(
+        config.focal_length * theta.cos(),
+        y_world,
+        config.focal_length * theta.sin(),
+    );
+    let dir = hit.normalize();
+    direction_to_yaw_pitch(&dir, &CYLINDRICAL_CAMERA_REST_POSITION)
+}
+
+/// Panorama-space (yaw, pitch) bounds, in radians, of the region a
+/// [`CylindricalProjection`] actually has video painted on.
+///
+/// Sampled along the border of the source frame via
+/// [`cylindrical_to_panorama`] rather than derived in closed form: the
+/// video-rect-to-panorama mapping couples yaw and pitch (a corner and
+/// an edge midpoint at the same `norm_x` land at different yaw once
+/// `norm_y` shifts `y_world`), so the border is where the true extremes
+/// occur and an axis-aligned bounding box over it is the same
+/// conservative-envelope approach [`CoverageBoundary`] uses for the
+/// L-shape path (there, tessellated across a 2D grid; here, cheap
+/// enough to just sample every border pixel column/row).
+///
+/// A caller that wants to keep a virtual camera's *full viewport* (not
+/// just its center ray) inside the painted region should inset these
+/// bounds by half the viewport's angular extent on each side - see
+/// [`crate::core::mono::MonoStitchCore`]'s pose-resolution step, which
+/// does exactly that to keep the rendered crop free of the black
+/// out-of-coverage wedges a pose too close to the edge produces.
+pub fn cylindrical_panorama_bounds(config: &CylindricalProjectionConfig) -> ((f32, f32), (f32, f32)) {
+    const SAMPLES: usize = 64;
+    let mut yaw_min = f32::INFINITY;
+    let mut yaw_max = f32::NEG_INFINITY;
+    let mut pitch_min = f32::INFINITY;
+    let mut pitch_max = f32::NEG_INFINITY;
+    let mut visit = |norm_x: f32, norm_y: f32| {
+        let pos = cylindrical_to_panorama(norm_x, norm_y, config);
+        yaw_min = yaw_min.min(pos.yaw);
+        yaw_max = yaw_max.max(pos.yaw);
+        pitch_min = pitch_min.min(pos.pitch);
+        pitch_max = pitch_max.max(pos.pitch);
+    };
+    for i in 0..=SAMPLES {
+        let t = i as f32 / SAMPLES as f32;
+        visit(t, 0.0);
+        visit(t, 1.0);
+        visit(0.0, t);
+        visit(1.0, t);
+    }
+    ((yaw_min, yaw_max), (pitch_min, pitch_max))
 }
 
 /// Maximum Newton-Raphson iterations for KB4 inverse distortion.
@@ -638,6 +766,49 @@ fn inverse_fisheye(dist_x: f64, dist_y: f64, params: &CameraParams) -> Option<(f
     Some((uv_x, uv_y))
 }
 
+/// Project a 3D world point through a posed KB4 fisheye camera to a
+/// normalized `[0,1]` pixel coordinate.
+///
+/// Standard Kannala-Brandt equidistant-fisheye projection: `pose`
+/// transforms world -> camera-local coordinates (camera looks down
+/// `+Z`, matching every other camera convention in this module -
+/// see [`CYLINDRICAL_CAMERA_REST_POSITION`]'s doc comment). Works
+/// directly on the ray's `(x, y, z)` via `atan2`, unlike
+/// [`forward_fisheye`]/[`kb4_forward_scale`](crate::lens::kb4_forward_scale)'s
+/// `r = tan(theta)` plane-UV convention, which is only valid for
+/// `theta < FRAC_PI_2` - a wide fisheye's field of view routinely
+/// exceeds that, so this function is the one to use for a camera's
+/// *own* raw field of view (mono self-calibration) rather than a
+/// flat stitching-plane's UV space.
+///
+/// Returns `None` for points effectively at the camera (degenerate
+/// direction) or beyond `max_theta_rad` from the optical axis (default
+/// caller should pass `f64::consts::PI` for "no limit" during
+/// calibration solves, and a calibrated lens's actual max field of
+/// view once known).
+pub fn project_world_point(
+    pose: &nalgebra::Isometry3<f64>,
+    world_point: &nalgebra::Point3<f64>,
+    params: &CameraParams,
+    max_theta_rad: f64,
+) -> Option<(f64, f64)> {
+    let p = pose.transform_point(world_point);
+    let r = (p.x * p.x + p.y * p.y).sqrt();
+    let theta = r.atan2(p.z);
+    if !(0.0..=max_theta_rad).contains(&theta) {
+        return None;
+    }
+    let theta_d = crate::lens::kb4::theta_d(theta, &params.d);
+    let (sx, sy) = if r < 1e-12 {
+        (0.0, 0.0)
+    } else {
+        (theta_d * p.x / r, theta_d * p.y / r)
+    };
+    let px = params.fx * sx + params.cx;
+    let py = params.fy * sy + params.cy;
+    Some((px / params.width as f64, py / params.height as f64))
+}
+
 /// Exact inverse of [`plane_uv_to_world`].
 ///
 /// Given a world-space point that lies on the named camera's plane,
@@ -985,6 +1156,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn project_world_point_on_axis_maps_to_principal_point() {
+        let params = CameraParams {
+            width: 3840,
+            height: 2160,
+            fx: 1796.32,
+            fy: 1797.22,
+            cx: 1919.37,
+            cy: 1063.17,
+            d: [0.0342, 0.0677, -0.0741, 0.0299],
+        };
+        let pose = nalgebra::Isometry3::identity();
+        // Straight ahead on the optical axis (+Z), any distance.
+        let world_point = nalgebra::Point3::new(0.0, 0.0, 5.0);
+        let (px, py) =
+            project_world_point(&pose, &world_point, &params, std::f64::consts::PI).unwrap();
+        assert!((px - params.cx / params.width as f64).abs() < 1e-9);
+        assert!((py - params.cy / params.height as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn project_world_point_zero_distortion_matches_pinhole() {
+        let params = CameraParams {
+            width: 1000,
+            height: 1000,
+            fx: 500.0,
+            fy: 500.0,
+            cx: 500.0,
+            cy: 500.0,
+            d: [0.0, 0.0, 0.0, 0.0],
+        };
+        let pose = nalgebra::Isometry3::identity();
+        // A SMALL off-axis point (theta ~0.77 deg): the KB4-equidistant
+        // model (theta_d = theta exactly, since d=0) and the standard
+        // pinhole model (tan(theta)-based) are different formulas in
+        // general, but converge for small theta - this is deliberately
+        // not a wide-angle point (see the dedicated max_theta test for
+        // that regime), just confirming the near-axis behavior is sane.
+        let world_point = nalgebra::Point3::new(0.05, 0.02, 4.0);
+        let (px, py) =
+            project_world_point(&pose, &world_point, &params, std::f64::consts::PI).unwrap();
+
+        let pinhole_x = params.fx * world_point.x / world_point.z + params.cx;
+        let pinhole_y = params.fy * world_point.y / world_point.z + params.cy;
+        assert!((px - pinhole_x / params.width as f64).abs() < 1e-5);
+        assert!((py - pinhole_y / params.height as f64).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_world_point_rejects_beyond_max_theta() {
+        let params = CameraParams {
+            width: 1000,
+            height: 1000,
+            fx: 500.0,
+            fy: 500.0,
+            cx: 500.0,
+            cy: 500.0,
+            d: [0.0, 0.0, 0.0, 0.0],
+        };
+        let pose = nalgebra::Isometry3::identity();
+        // 90 degrees off-axis (in the camera's own local x-y plane).
+        let world_point = nalgebra::Point3::new(1.0, 0.0, 0.0);
+        assert!(project_world_point(&pose, &world_point, &params, 1.0).is_none());
+        assert!(
+            project_world_point(&pose, &world_point, &params, std::f64::consts::PI).is_some()
+        );
     }
 
     #[test]
@@ -1384,5 +1623,147 @@ mod tests {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<CylindricalProjection>();
         assert_send_sync::<CylindricalProjectionConfig>();
+    }
+
+    // `cylindrical_to_panorama` is the exact inverse of
+    // `cylindrical_mono.wgsl`'s forward ray-cast, which I cannot execute
+    // in a unit test (no GPU here). These check convention-agnostic
+    // geometric invariants of the cylinder-at-origin construction
+    // instead, so a sign error in either the shader or this function
+    // would still very likely be caught: the vertical axis of the
+    // cylinder is world Y, and the camera sits at the origin on that
+    // axis, so any point at the vertical image center (v_norm = 0.5,
+    // i.e. y_world = 0) must be exactly level (pitch = 0) regardless of
+    // yaw convention, and left/right/top/bottom must be symmetric
+    // around the center.
+
+    #[test]
+    fn cylindrical_to_panorama_vertical_center_is_level() {
+        let config = CylindricalProjectionConfig::default();
+        for norm_x in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let pos = cylindrical_to_panorama(norm_x, 0.5, &config);
+            assert!(
+                pos.pitch.abs() < 1e-5,
+                "vertical center (norm_x={norm_x}) must be level, got pitch={}",
+                pos.pitch
+            );
+        }
+    }
+
+    #[test]
+    fn cylindrical_to_panorama_left_right_symmetric_around_center() {
+        let config = CylindricalProjectionConfig::default();
+        let center = cylindrical_to_panorama(0.5, 0.5, &config);
+        let left = cylindrical_to_panorama(0.0, 0.5, &config);
+        let right = cylindrical_to_panorama(1.0, 0.5, &config);
+
+        assert_ne!(
+            left.yaw, right.yaw,
+            "left/right edges must map to different yaw"
+        );
+        assert!(
+            (left.yaw - center.yaw).abs() > 1e-3,
+            "left edge must differ from center"
+        );
+        assert!(
+            (right.yaw - center.yaw).abs() > 1e-3,
+            "right edge must differ from center"
+        );
+        // 180-degree default sweep, centered: edges are symmetric around
+        // the center yaw (opposite sign of displacement).
+        assert!(
+            ((left.yaw - center.yaw) + (right.yaw - center.yaw)).abs() < 1e-3,
+            "left/right displacement from center must be symmetric: left={}, right={}, center={}",
+            left.yaw,
+            right.yaw,
+            center.yaw
+        );
+    }
+
+    #[test]
+    fn cylindrical_to_panorama_top_bottom_symmetric_and_opposite_sign() {
+        // Not `CylindricalProjectionConfig::default()`: its
+        // `focal_length=2400` vs. `video_height=1.0` are world-unit
+        // values meant to be set consistently by the actual consumer
+        // (matching actionstitch's Three.js scene scale) - taken
+        // literally together they subtend a near-zero vertical angle,
+        // which would make this test's edges spuriously "almost
+        // level" regardless of correctness. Any config with a
+        // comparable focal_length/video_height ratio exercises the
+        // same geometry meaningfully.
+        let config = CylindricalProjectionConfig {
+            focal_length: 1.0,
+            video_height: 1.0,
+            ..CylindricalProjectionConfig::default()
+        };
+        let top = cylindrical_to_panorama(0.5, 0.0, &config);
+        let bottom = cylindrical_to_panorama(0.5, 1.0, &config);
+
+        assert!(top.pitch.abs() > 1e-3, "top edge must not be level");
+        assert!(
+            (top.pitch + bottom.pitch).abs() < 1e-3,
+            "top/bottom must be symmetric and opposite sign: top={}, bottom={}",
+            top.pitch,
+            bottom.pitch
+        );
+        assert_ne!(top.pitch.signum(), bottom.pitch.signum());
+    }
+
+    /// [`CylindricalProjectionConfig::video_height_for_aspect`] exists
+    /// precisely to avoid the near-zero-vertical-angle trap the
+    /// previous test's comment describes for the bare
+    /// `focal_length=2400`/`video_height=1.0` default pairing - a 16:9
+    /// source run through it must produce meaningful top/bottom pitch,
+    /// not the ~0.01-degree sliver the unscaled default gives.
+    #[test]
+    fn video_height_for_aspect_gives_meaningful_pitch_range_for_default_focal_length() {
+        let focal_length = CylindricalProjectionConfig::default().focal_length;
+        let angular_sweep_rad = CylindricalProjectionConfig::default().angular_sweep_rad;
+        let video_height = CylindricalProjectionConfig::video_height_for_aspect(
+            focal_length,
+            angular_sweep_rad,
+            1920,
+            1080,
+        );
+        let config = CylindricalProjectionConfig {
+            video_height,
+            ..CylindricalProjectionConfig::default()
+        };
+
+        let top = cylindrical_to_panorama(0.5, 0.0, &config);
+        let bottom = cylindrical_to_panorama(0.5, 1.0, &config);
+
+        // The unscaled default (video_height=1.0 against
+        // focal_length=2400) gives top.pitch on the order of 1e-4 rad;
+        // a correctly scaled 16:9 patch should give degrees, not
+        // hundredths of a degree.
+        assert!(
+            top.pitch.abs() > 0.1,
+            "expected a meaningful vertical FOV, got top.pitch={}",
+            top.pitch
+        );
+        assert!((top.pitch + bottom.pitch).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cylindrical_panorama_bounds_are_symmetric_and_nonempty() {
+        let focal_length = CylindricalProjectionConfig::default().focal_length;
+        let angular_sweep_rad = CylindricalProjectionConfig::default().angular_sweep_rad;
+        let video_height = CylindricalProjectionConfig::video_height_for_aspect(
+            focal_length,
+            angular_sweep_rad,
+            1920,
+            1080,
+        );
+        let config = CylindricalProjectionConfig {
+            video_height,
+            ..CylindricalProjectionConfig::default()
+        };
+        let ((yaw_min, yaw_max), (pitch_min, pitch_max)) = cylindrical_panorama_bounds(&config);
+
+        assert!(yaw_min < 0.0 && yaw_max > 0.0, "yaw range must straddle center");
+        assert!((yaw_min + yaw_max).abs() < 1e-3, "yaw bounds symmetric around 0");
+        assert!(pitch_min < 0.0 && pitch_max > 0.0);
+        assert!((pitch_min + pitch_max).abs() < 1e-3);
     }
 }

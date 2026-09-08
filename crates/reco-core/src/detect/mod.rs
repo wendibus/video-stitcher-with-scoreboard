@@ -11,9 +11,11 @@ pub mod pipeline_event;
 pub mod tracker;
 
 /// Shared interface for types that accept detection/tracking/panning
-/// configuration. Implemented by both [`StitchCore`](crate::core::StitchCore)
-/// and [`StitchSession`](crate::session::StitchSession), so consumers like
-/// `reco_autocam::setup_autocam` can configure either without duplication.
+/// configuration. Implemented by [`StitchCore`](crate::core::StitchCore),
+/// [`StitchSession`](crate::session::StitchSession), and
+/// [`MonoStitchCore`](crate::core::mono::MonoStitchCore), so consumers like
+/// `reco_autocam::setup_autocam` can configure any of them without
+/// duplication.
 pub trait DetectionTarget {
     /// Attach a detector backend.
     fn set_detector(&mut self, detector: Box<dyn detector::UnifiedDetector>);
@@ -25,8 +27,15 @@ pub trait DetectionTarget {
     fn set_player_tracker(&mut self, tracker: Box<dyn tracker::Tracker>);
     /// Attach a panner that resolves viewport pose from tracked state.
     fn set_panner(&mut self, panner: Box<dyn panner::Panner>);
-    /// Shared reference to the pipeline (for source_info, calibration).
-    fn pipeline(&self) -> &crate::render::pipeline::StitchPipeline;
+    /// Input frame dimensions as `(width, height)`.
+    ///
+    /// Was `fn pipeline(&self) -> &StitchPipeline` before `MonoStitchCore`
+    /// (which has no `StitchPipeline` - it wraps
+    /// [`MonoPipeline`](crate::render::mono_pipeline::MonoPipeline)
+    /// instead) needed to implement this trait too; every caller only
+    /// ever used `pipeline().source_info()`, so the trait now exposes
+    /// that directly instead of the concrete stereo pipeline type.
+    fn source_info(&self) -> (u32, u32);
     /// Shared reference to the GPU context.
     fn gpu(&self) -> &crate::gpu::GpuContext;
 }

@@ -60,6 +60,7 @@ use reco_core::profile_scope;
 
 pub(crate) mod akaze;
 pub mod audio_sync;
+pub mod court_points;
 pub mod defaults;
 pub mod error;
 pub mod features;
@@ -72,6 +73,7 @@ pub mod lens_database;
 /// not require the `io` feature — the source is a trait object supplied
 /// by the consumer, not a file.
 pub mod live;
+pub mod mono_optimizer;
 pub mod optimizer;
 pub mod pipeline;
 mod ransac;

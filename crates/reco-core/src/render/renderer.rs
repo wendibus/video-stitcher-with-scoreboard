@@ -138,15 +138,19 @@ fn quad_vertices(aspect: f32) -> [Vertex; 6] {
 // ---- Renderer ----
 
 /// Per-plane GPU resources (YUV textures + uniform buffer + bind groups).
-struct PlaneResources {
+///
+/// `pub(crate)` (rather than private) so [`super::mono_renderer::MonoRenderer`]
+/// can reuse it for its single plane instead of duplicating the texture/
+/// bind-group setup.
+pub(crate) struct PlaneResources {
     y_texture: wgpu::Texture,
     u_texture: wgpu::Texture,
     v_texture: wgpu::Texture,
-    texture_bind_group: wgpu::BindGroup,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-    width: u32,
-    height: u32,
+    pub(crate) texture_bind_group: wgpu::BindGroup,
+    pub(crate) uniform_buffer: wgpu::Buffer,
+    pub(crate) uniform_bind_group: wgpu::BindGroup,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// Input pixel format for the renderer.
@@ -435,7 +439,11 @@ impl Renderer {
         }
     }
 
-    fn create_plane_resources(
+    /// `pub(crate)` so [`super::mono_renderer::MonoRenderer`] can build its
+    /// single plane's textures/bind-groups with the exact same layout
+    /// convention as the stereo path instead of duplicating this ~80-line
+    /// texture setup.
+    pub(crate) fn create_plane_resources(
         device: &wgpu::Device,
         texture_layout: &wgpu::BindGroupLayout,
         uniform_layout: &wgpu::BindGroupLayout,
@@ -1079,7 +1087,9 @@ fn upload_plane(gpu: &GpuContext, texture: &wgpu::Texture, data: &[u8], width: u
 }
 
 /// Upload YUV420P planes (Y full-res, U/V half-res) to GPU textures.
-fn upload_yuv(
+///
+/// `pub(crate)` so [`super::mono_renderer::MonoRenderer`] can reuse it.
+pub(crate) fn upload_yuv(
     gpu: &GpuContext,
     plane: &PlaneResources,
     y: &[u8],
@@ -1120,7 +1130,9 @@ fn upload_yuv(
 ///
 /// UV plane is `Rg8Unorm` at half resolution in each dimension.
 /// Each texel contains (U, V) as two bytes.
-fn upload_nv12(
+///
+/// `pub(crate)` so [`super::mono_renderer::MonoRenderer`] can reuse it.
+pub(crate) fn upload_nv12(
     gpu: &GpuContext,
     plane: &PlaneResources,
     y: &[u8],
@@ -1174,7 +1186,13 @@ fn upload_nv12(
 /// planes meet) by default. This matches v1 Three.js where the OrbitControls
 /// target is `[0, 0, 0]`. `yaw` rotates around Y (left/right from center),
 /// `pitch` rotates around X (up/down).
-fn view_matrix(
+///
+/// `pub(crate)` so [`super::mono_renderer`] can reuse the same yaw/pitch/
+/// rig-tilt/rig-roll convention instead of re-deriving it - the cylindrical
+/// shader wants the inverse (view-to-world) of what this returns, since it
+/// rotates a camera-space ray into world space rather than transforming
+/// world-space points into camera space.
+pub(crate) fn view_matrix(
     position: &[f32; 3],
     yaw: f32,
     pitch: f32,

@@ -211,7 +211,7 @@ pub fn setup_autocam(
         return Ok(false);
     }
 
-    let (input_width, input_height) = target.pipeline().source_info();
+    let (input_width, input_height) = target.source_info();
     let use_zero_copy = source_is_gpu_resident;
     let model_path = config.model_path.to_str().unwrap_or("");
     let detection_interval = config.detection_interval;

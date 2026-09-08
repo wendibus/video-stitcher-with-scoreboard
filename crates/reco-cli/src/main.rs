@@ -5,11 +5,13 @@
 //! ```
 
 mod calibrate;
+mod calibrate_mono;
 #[cfg(feature = "gstreamer")]
 mod camera;
 mod helpers;
 #[cfg(feature = "libcamera")]
 mod libcamera_cmd;
+mod mono;
 mod preview;
 mod stitch;
 
@@ -276,6 +278,83 @@ enum Commands {
         /// basketball (indoor court, single-class ball models).
         #[arg(long = "panner-preset")]
         panner_preset: Option<String>,
+    },
+
+    /// Track a ball in a single-camera (not yet stitched/projected)
+    /// video and encode the followed crop. No calibration file - the
+    /// cylindrical projection needs only lens/geometry parameters, not
+    /// a two-camera stereo calibration.
+    Mono {
+        /// Path to the source video file.
+        input: String,
+
+        /// Output file path.
+        #[arg(short, long, default_value = "output.mp4")]
+        output: String,
+
+        /// Output width in pixels.
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+
+        /// Output height in pixels.
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+
+        /// Force a specific encoder (e.g., h264_nvenc, hevc_nvenc, libx264). Auto-detects by default.
+        #[arg(long)]
+        encoder: Option<String>,
+
+        /// Output codec: h264, hevc, av1. Default: h264.
+        #[arg(long, default_value = "h264")]
+        codec: String,
+
+        /// Quality preset: fast, balanced, high.
+        #[arg(long, default_value = "balanced")]
+        quality: String,
+
+        /// Encoder quality on a 0-100 scale (higher = better). Overrides the
+        /// quality preset with a precise value.
+        #[arg(long = "quality-value")]
+        quality_value: Option<u8>,
+
+        /// Override encoder preset (e.g. ultrafast, veryfast, fast for x264; p1-p7 for NVENC).
+        #[arg(long)]
+        preset: Option<String>,
+
+        /// Drop the source audio instead of copying it into the output.
+        #[arg(long, default_value_t = false)]
+        no_audio: bool,
+
+        /// Path to an RF-DETR or YOLO ONNX model for ball detection and auto-panning.
+        /// Required unless --tracking sweep.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Run detection every N frames (default: 1 = every frame).
+        #[arg(long, default_value_t = 1)]
+        detection_interval: u64,
+
+        /// Tracking mode: "field" (ball + players, default), "ball"
+        /// (ball only), "sweep" (no AI, debug pan).
+        #[arg(long, default_value = "field")]
+        tracking: String,
+
+        /// FieldPanner tuning as a JSON file. Only the keys present
+        /// override the base, e.g. {"dead_zone_rad":0.087}. Overlays
+        /// on --panner-preset if both set.
+        #[arg(long = "panner-config")]
+        panner_config: Option<String>,
+
+        /// Named panner preset: broadcast (default), action, frame_all,
+        /// basketball (indoor court, single-class ball models).
+        #[arg(long = "panner-preset")]
+        panner_preset: Option<String>,
+
+        /// Continue without tracking if detection cannot run. By
+        /// default the CLI errors out when --model is given but
+        /// detection fails to initialize.
+        #[arg(long, default_value_t = false)]
+        allow_no_tracking: bool,
     },
 
     /// Open an interactive preview window to debug the stitch.
@@ -650,6 +729,33 @@ enum Commands {
         output: String,
     },
 
+    /// Self-calibrate a single raw camera's KB4 fisheye intrinsics +
+    /// pose from clicked correspondences against known basketball
+    /// court geometry (no checkerboard shoot needed). Feeds the mono
+    /// pipeline's KB4 render path.
+    CalibrateMono {
+        /// Path to the raw camera video file.
+        video: String,
+
+        /// Timestamp (seconds) of the frame to extract for calibration.
+        #[arg(long, default_value_t = 5.0)]
+        frame_time: f64,
+
+        /// Skip the browser round-trip and use an already-saved
+        /// clicked-points JSON file (from a previous `court_points.json`
+        /// download) instead.
+        #[arg(long)]
+        points: Option<String>,
+
+        /// Max Nelder-Mead iterations per multi-start run.
+        #[arg(long, default_value_t = 800)]
+        max_iters: u64,
+
+        /// Output calibration JSON file path.
+        #[arg(short, long, default_value = "mono_calibration.json")]
+        output: String,
+    },
+
     /// Display information about the GPU and system capabilities.
     Info,
 
@@ -808,6 +914,45 @@ fn main() -> anyhow::Result<()> {
                 trajectory_path: trajectory.as_deref(),
                 panner_config_path: panner_config.as_deref(),
                 panner_preset: panner_preset.as_deref(),
+            },
+            &interrupted,
+        ),
+
+        Commands::Mono {
+            input,
+            output,
+            width,
+            height,
+            encoder,
+            codec,
+            quality,
+            quality_value,
+            preset,
+            no_audio,
+            model,
+            detection_interval,
+            tracking,
+            panner_config,
+            panner_preset,
+            allow_no_tracking,
+        } => mono::run_mono(
+            mono::MonoArgs {
+                input: &input,
+                output: &output,
+                width,
+                height,
+                encoder_name: encoder,
+                codec: &codec,
+                quality: &quality,
+                quality_value,
+                preset,
+                no_audio,
+                model_path: model.as_deref(),
+                detection_interval,
+                tracking_mode: &tracking,
+                panner_preset: panner_preset.as_deref(),
+                panner_config_path: panner_config.as_deref(),
+                allow_no_tracking,
             },
             &interrupted,
         ),
@@ -1061,6 +1206,20 @@ fn main() -> anyhow::Result<()> {
             trim,
             seam_sigma,
             debug_dir.as_deref(),
+            &output,
+        ),
+
+        Commands::CalibrateMono {
+            video,
+            frame_time,
+            points,
+            max_iters,
+            output,
+        } => calibrate_mono::run_calibrate_mono(
+            &video,
+            frame_time,
+            points.as_deref(),
+            max_iters,
             &output,
         ),
 
