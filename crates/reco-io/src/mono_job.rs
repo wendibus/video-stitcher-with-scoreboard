@@ -81,6 +81,7 @@ pub struct MonoJob {
     max_theta_rad: f32,
     rig_tilt: f32,
     rig_roll: f32,
+    fov_degrees: Option<f32>,
 
     codec: Codec,
     bitrate: Bitrate,
@@ -113,6 +114,7 @@ impl MonoJob {
             max_theta_rad: reco_core::core::mono::DEFAULT_MAX_THETA_RAD,
             rig_tilt: 0.0,
             rig_roll: 0.0,
+            fov_degrees: None,
             codec: Codec::default(),
             bitrate: Bitrate::default(),
             format: Format::default(),
@@ -142,6 +144,15 @@ impl MonoJob {
     pub fn rig_tilt_roll(mut self, tilt: f32, roll: f32) -> Self {
         self.rig_tilt = tilt;
         self.rig_roll = roll;
+        self
+    }
+
+    /// Output viewport's vertical field of view in degrees - smaller
+    /// zooms in (tighter crop, keeps the pan/tilt further from the
+    /// edge of the camera's calibrated coverage, avoiding black
+    /// corners); larger zooms out. Defaults to 75.0.
+    pub fn fov_degrees(mut self, degrees: f32) -> Self {
+        self.fov_degrees = Some(degrees);
         self
     }
 
@@ -222,6 +233,9 @@ impl MonoJob {
         config.viewport.height = out_h;
         config.viewport.rig_tilt = self.rig_tilt;
         config.viewport.rig_roll = self.rig_roll;
+        if let Some(fov) = self.fov_degrees {
+            config.viewport.fov_degrees = fov;
+        }
         config.input_format = InputFormat::Yuv420p;
         let mut core = MonoStitchCore::new(gpu, config)?;
 

@@ -306,6 +306,13 @@ enum Commands {
         #[arg(long, default_value_t = 1080)]
         height: u32,
 
+        /// Output viewport's vertical field of view in degrees.
+        /// Smaller zooms in (tighter crop, also keeps pan/tilt further
+        /// from the edge of the camera's calibrated coverage, avoiding
+        /// black corners if they show up at the default). Default 75.
+        #[arg(long)]
+        fov: Option<f32>,
+
         /// Force a specific encoder (e.g., h264_nvenc, hevc_nvenc, libx264). Auto-detects by default.
         #[arg(long)]
         encoder: Option<String>,
@@ -951,6 +958,7 @@ fn main() -> anyhow::Result<()> {
             output,
             width,
             height,
+            fov,
             encoder,
             codec,
             quality,
@@ -970,6 +978,7 @@ fn main() -> anyhow::Result<()> {
                 calibration: &calibration,
                 width,
                 height,
+                fov_degrees: fov,
                 encoder_name: encoder,
                 codec: &codec,
                 quality: &quality,

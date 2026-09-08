@@ -201,12 +201,22 @@ impl MonoStitchCore {
         })
     }
 
-    /// Inset [`kb4_mono_panorama_bounds`] by half the output
-    /// viewport's angular extent, so a pose clamped to the result keeps
-    /// the *entire rendered frame* inside the camera's calibrated
-    /// field of view - not just its center ray - eliminating the black
+    /// Inset [`kb4_mono_panorama_bounds`] by the output viewport's
+    /// *corner* half-angle, so a pose clamped to the result keeps the
+    /// *entire rendered frame* inside the camera's calibrated field of
+    /// view - not just its center ray - eliminating the black
     /// out-of-coverage wedges a pose too close to the edge of the
     /// camera's field of view produces.
+    ///
+    /// Uses the corner angle (`atan(hypot(tan_half_h, tan_half_v))`),
+    /// not the smaller edge-midpoint angles (`half_h_fov`/`half_v_fov`
+    /// alone) - a rectangular viewport's corners sit further from its
+    /// center than either edge's midpoint, since a corner combines
+    /// both the horizontal *and* vertical offset simultaneously. Only
+    /// margining by the edge angles (the original version of this
+    /// function did) under-protects exactly the corners, which is
+    /// what real-footage testing showed as a visible black-corner
+    /// artifact even with pose nowhere near `yaw_min`/`yaw_max` alone.
     ///
     /// Collapses to the midpoint on either axis where the viewport's
     /// own FOV is wider than the available coverage (nothing sensible
@@ -225,7 +235,9 @@ impl MonoStitchCore {
 
         let half_v_fov = fov_degrees.to_radians() * 0.5;
         let aspect = output_width as f32 / output_height.max(1) as f32;
-        let half_h_fov = (half_v_fov.tan() * aspect).atan();
+        let tan_half_v = half_v_fov.tan();
+        let tan_half_h = tan_half_v * aspect;
+        let corner_margin = tan_half_h.hypot(tan_half_v).atan();
 
         // Defense in depth against NaN reaching `resolve_current_pose`'s
         // `clamp` call (which panics on NaN bounds): `kb4_mono_panorama_bounds`
@@ -243,8 +255,8 @@ impl MonoStitchCore {
             }
         };
         (
-            inset(yaw_min, yaw_max, half_h_fov),
-            inset(pitch_min, pitch_max, half_v_fov),
+            inset(yaw_min, yaw_max, corner_margin),
+            inset(pitch_min, pitch_max, corner_margin),
         )
     }
 

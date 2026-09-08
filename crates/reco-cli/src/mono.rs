@@ -18,6 +18,7 @@ pub struct MonoArgs<'a> {
     pub calibration: &'a str,
     pub width: u32,
     pub height: u32,
+    pub fov_degrees: Option<f32>,
     pub encoder_name: Option<String>,
     pub codec: &'a str,
     pub quality: &'a str,
@@ -97,6 +98,9 @@ pub fn run_mono(args: MonoArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow::Re
     }
     if let Some(p) = args.preset {
         job = job.preset(p);
+    }
+    if let Some(fov) = args.fov_degrees {
+        job = job.fov_degrees(fov);
     }
 
     // Resolve FieldPanner tuning up front so a bad preset/file fails
