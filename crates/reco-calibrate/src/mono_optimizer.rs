@@ -208,12 +208,24 @@ fn build_simplex(start: &[f64], bounds: &[(f64, f64)]) -> Vec<Vec<f64>> {
     vertices
 }
 
-fn run_nelder_mead(
-    cost: &MonoCalibrationCost<'_>,
-    start: &[f64],
-    max_iters: u64,
-) -> Option<(Vec<f64>, f64)> {
-    let simplex = build_simplex(start, &cost.bounds);
+/// Bounds every `CostFunction` used by this module's multi-start
+/// search needs to expose, so [`run_nelder_mead`] can build the
+/// initial simplex generically.
+trait Bounded {
+    fn bounds(&self) -> &[(f64, f64)];
+}
+
+impl Bounded for MonoCalibrationCost<'_> {
+    fn bounds(&self) -> &[(f64, f64)] {
+        &self.bounds
+    }
+}
+
+fn run_nelder_mead<C>(cost: &C, start: &[f64], max_iters: u64) -> Option<(Vec<f64>, f64)>
+where
+    C: CostFunction<Param = Vec<f64>, Output = f64> + Bounded + Clone,
+{
+    let simplex = build_simplex(start, cost.bounds());
     let solver: NelderMead<Vec<f64>, f64> =
         NelderMead::new(simplex).with_sd_tolerance(1e-12).ok()?;
     let res = Executor::new(cost.clone(), solver)
@@ -359,6 +371,244 @@ fn mean_pixel_error(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Simplified calibration: 4 unlabeled court corners + unlabeled center-
+// circle points, instead of clicking all ~30 individually-named court
+// points. Removes the far-/near-/left-/right- labeling step entirely -
+// real-world use showed that keeping "which basket is far" consistent
+// across 30 clicks is the dominant source of bad calibrations, not a
+// shortage of correspondence points. The corner labeling ambiguity is
+// resolved by brute-forcing all 24 permutations of "which clicked point
+// is which corner" (cheap: a wrong permutation fits far worse than the
+// right one, the same logic RANSAC-style hypothesis testing relies on).
+// The circle points don't need per-point correspondence at all: each is
+// scored against the nearest point on the *projected* circle curve.
+// ---------------------------------------------------------------------------
+
+/// The 4 court corners, world meters, in a fixed reference order that
+/// clicked corners are permuted against during search - see
+/// [`optimize_corners_and_circle`].
+const CORNERS_WORLD_M: [[f64; 2]; 4] = [[-7.5, -14.0], [7.5, -14.0], [7.5, 14.0], [-7.5, 14.0]];
+
+const CENTER_CIRCLE_RADIUS_M: f64 = 1.8;
+
+/// World-space samples around the center circle used for the
+/// nearest-point-on-curve residual - dense enough that the piecewise-
+/// linear approximation error is negligible next to real click noise.
+const CIRCLE_SAMPLE_COUNT: usize = 180;
+
+/// All 24 permutations of `[0,1,2,3]` - every possible assignment of 4
+/// clicked corner points to [`CORNERS_WORLD_M`]'s 4 known corners.
+/// Hardcoded rather than generated: there are only 24, and a fixed
+/// table is easier to verify by inspection than a permutation
+/// algorithm's correctness.
+#[rustfmt::skip]
+const CORNER_PERMUTATIONS: [[usize; 4]; 24] = [
+    [0,1,2,3], [0,1,3,2], [0,2,1,3], [0,2,3,1], [0,3,1,2], [0,3,2,1],
+    [1,0,2,3], [1,0,3,2], [1,2,0,3], [1,2,3,0], [1,3,0,2], [1,3,2,0],
+    [2,0,1,3], [2,0,3,1], [2,1,0,3], [2,1,3,0], [2,3,0,1], [2,3,1,0],
+    [3,0,1,2], [3,0,2,1], [3,1,0,2], [3,1,2,0], [3,2,0,1], [3,2,1,0],
+];
+
+struct CornersCircleCost<'a> {
+    /// The 4 clicked corner pixels, already reordered so index `i`
+    /// corresponds to `CORNERS_WORLD_M[i]` under the permutation this
+    /// trial is testing.
+    corners_px: [[f64; 2]; 4],
+    circle_px: &'a [[f64; 2]],
+    width: u32,
+    height: u32,
+    bounds: Vec<(f64, f64)>,
+}
+
+impl Clone for CornersCircleCost<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            corners_px: self.corners_px,
+            circle_px: self.circle_px,
+            width: self.width,
+            height: self.height,
+            bounds: self.bounds.clone(),
+        }
+    }
+}
+
+impl Bounded for CornersCircleCost<'_> {
+    fn bounds(&self) -> &[(f64, f64)] {
+        &self.bounds
+    }
+}
+
+/// Project [`CIRCLE_SAMPLE_COUNT`] points around the world center
+/// circle through `pose`/`camera`, keeping only the ones that project
+/// successfully.
+fn project_circle_samples(
+    pose: &Isometry3<f64>,
+    camera: &CameraParams,
+) -> Vec<(f64, f64)> {
+    (0..CIRCLE_SAMPLE_COUNT)
+        .filter_map(|s| {
+            let theta = s as f64 * std::f64::consts::TAU / CIRCLE_SAMPLE_COUNT as f64;
+            let world_point = Point3::new(
+                CENTER_CIRCLE_RADIUS_M * theta.cos(),
+                CENTER_CIRCLE_RADIUS_M * theta.sin(),
+                0.0,
+            );
+            project_world_point(pose, &world_point, camera, SOLVE_MAX_THETA_RAD)
+        })
+        .collect()
+}
+
+impl CostFunction for CornersCircleCost<'_> {
+    type Param = Vec<f64>;
+    type Output = f64;
+
+    fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
+        let (pose, camera) = unpack(p, self.width, self.height);
+
+        let mut err = 0.0;
+        for (i, corner_world) in CORNERS_WORLD_M.iter().enumerate() {
+            let world_point = Point3::new(corner_world[0], corner_world[1], 0.0);
+            match project_world_point(&pose, &world_point, &camera, SOLVE_MAX_THETA_RAD) {
+                Some((px, py)) => {
+                    err += (px - self.corners_px[i][0]).powi(2) + (py - self.corners_px[i][1]).powi(2)
+                }
+                None => err += MISSING_POINT_PENALTY,
+            }
+        }
+
+        let circle_proj = project_circle_samples(&pose, &camera);
+        for c in self.circle_px {
+            if circle_proj.is_empty() {
+                err += MISSING_POINT_PENALTY;
+                continue;
+            }
+            let nearest = circle_proj
+                .iter()
+                .map(|&(px, py)| (px - c[0]).powi(2) + (py - c[1]).powi(2))
+                .fold(f64::INFINITY, f64::min);
+            err += nearest;
+        }
+
+        let total = 4 + self.circle_px.len();
+        let mean_err = err / total.max(1) as f64;
+        Ok(mean_err + bounds_penalty(p, &self.bounds))
+    }
+}
+
+/// Solve for this camera's KB4 intrinsics + pose from 4 unlabeled
+/// court corners and a handful of unlabeled center-circle points,
+/// instead of ~30 individually-named correspondences - see the module
+/// docs above [`CORNERS_WORLD_M`] for why this exists.
+///
+/// `corners_px` is the 4 clicked corner pixels in *whatever order they
+/// were clicked* - every possible assignment to the court's actual 4
+/// corners is tried, so no click order is required from the user.
+/// `circle_px` is any number (recommend >= 5) of points clicked
+/// anywhere around the visible part of the center circle, also in no
+/// particular order.
+///
+/// # Errors
+///
+/// [`CalibrateError::OptimizerFailed`] if every permutation/multi-start
+/// combination fails to produce a result.
+pub fn optimize_corners_and_circle(
+    corners_px: &[[f64; 2]; 4],
+    circle_px: &[[f64; 2]],
+    width: u32,
+    height: u32,
+    max_iters: u64,
+) -> Result<MonoCalibrationResult, CalibrateError> {
+    let diagonal_px = ((width * width + height * height) as f64).sqrt();
+    let bounds = bounds_for(diagonal_px);
+
+    let mut best: Option<(Vec<f64>, f64, [[f64; 2]; 4])> = None;
+    for perm in &CORNER_PERMUTATIONS {
+        let reordered = [
+            corners_px[perm[0]],
+            corners_px[perm[1]],
+            corners_px[perm[2]],
+            corners_px[perm[3]],
+        ];
+        let cost = CornersCircleCost {
+            corners_px: reordered,
+            circle_px,
+            width,
+            height,
+            bounds: bounds.clone(),
+        };
+        for &fov_deg in &FOV_SEEDS_DEG {
+            let f = f_seed_for_diagonal_fov_deg(diagonal_px, fov_deg);
+            for rotation in rotation_seeds() {
+                for &height_m in &HEIGHT_SEEDS_M {
+                    for &(lat_x, lat_y) in &LATERAL_SEEDS_M {
+                        let start = vec![
+                            f, 0.0, 0.0, rotation.x, rotation.y, rotation.z, lat_x, lat_y, height_m,
+                        ];
+                        if let Some((p, c)) = run_nelder_mead(&cost, &start, max_iters)
+                            && best.as_ref().is_none_or(|(_, best_c, _)| c < *best_c)
+                        {
+                            best = Some((p, c, reordered));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (best_p, best_cost, winning_corners) = best.ok_or(CalibrateError::OptimizerFailed {
+        max_evals: max_iters as usize,
+    })?;
+    let _ = best_cost;
+    let (pose, camera) = unpack(&best_p, width, height);
+    let camera_world_position = pose.inverse().translation.vector;
+
+    // Reprojection error over the same points the solve used, in real
+    // pixels - mirrors `mean_pixel_error`'s statistic (mean of
+    // per-point Euclidean distances, not RMS) so the `>15px` warning
+    // threshold in `reco-cli` behaves the same regardless of which
+    // solve path produced the result.
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    for (i, corner_world) in CORNERS_WORLD_M.iter().enumerate() {
+        let world_point = Point3::new(corner_world[0], corner_world[1], 0.0);
+        if let Some((px, py)) = project_world_point(&pose, &world_point, &camera, SOLVE_MAX_THETA_RAD)
+        {
+            let dx = (px - winning_corners[i][0]) * width as f64;
+            let dy = (py - winning_corners[i][1]) * height as f64;
+            sum += (dx * dx + dy * dy).sqrt();
+            n += 1;
+        }
+    }
+    let circle_proj = project_circle_samples(&pose, &camera);
+    for c in circle_px {
+        if let Some(nearest) = circle_proj
+            .iter()
+            .map(|&(px, py)| {
+                let dx = (px - c[0]) * width as f64;
+                let dy = (py - c[1]) * height as f64;
+                (dx * dx + dy * dy).sqrt()
+            })
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            sum += nearest;
+            n += 1;
+        }
+    }
+    let mean_reprojection_error_px = if n == 0 { f64::INFINITY } else { sum / n as f64 };
+
+    Ok(MonoCalibrationResult {
+        camera,
+        rotation_axis_angle: [best_p[3], best_p[4], best_p[5]],
+        camera_position_m: [
+            camera_world_position.x,
+            camera_world_position.y,
+            camera_world_position.z,
+        ],
+        mean_reprojection_error_px,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +661,78 @@ mod tests {
         );
 
         let result = optimize(&points, width, height, 800).expect("optimization should succeed");
+
+        assert!(
+            result.mean_reprojection_error_px < 5.0,
+            "reprojection error too high: {} px",
+            result.mean_reprojection_error_px
+        );
+        assert!(
+            (result.camera.fx - true_camera.fx).abs() < true_camera.fx * 0.1,
+            "fx off: got {}, want {}",
+            result.camera.fx,
+            true_camera.fx
+        );
+        assert!(
+            (result.camera_position_m[2] - 9.0).abs() < 2.0,
+            "recovered height implausible: {}",
+            result.camera_position_m[2]
+        );
+    }
+
+    #[test]
+    fn optimize_corners_and_circle_recovers_known_camera_regardless_of_click_order() {
+        let width = 3840u32;
+        let height = 2160u32;
+        let true_camera = CameraParams {
+            width,
+            height,
+            fx: 1400.0,
+            fy: 1400.0,
+            cx: width as f64 * 0.5,
+            cy: height as f64 * 0.5,
+            d: [0.02, -0.01, 0.0, 0.0],
+        };
+        let true_rotation = Vector3::new(std::f64::consts::PI - 0.2, 0.0, 0.0);
+        let true_position = Point3::new(0.0, 0.0, 9.0);
+        let true_pose = pose_from_rotation_and_position(true_rotation, true_position);
+
+        // Corners clicked in a scrambled order (not matching
+        // CORNERS_WORLD_M's order at all) - this is exactly what the
+        // permutation search exists to handle.
+        let scrambled_order = [2, 0, 3, 1];
+        let corners_px: Vec<[f64; 2]> = scrambled_order
+            .iter()
+            .map(|&i| {
+                let [x, y] = CORNERS_WORLD_M[i];
+                let world_point = Point3::new(x, y, 0.0);
+                let (px, py) =
+                    project_world_point(&true_pose, &world_point, &true_camera, SOLVE_MAX_THETA_RAD)
+                        .expect("corner should be visible");
+                [px, py]
+            })
+            .collect();
+        let corners_px: [[f64; 2]; 4] = corners_px.try_into().unwrap();
+
+        // Circle points at arbitrary, unordered angles.
+        let circle_angles_deg = [10.0_f64, 95.0, 160.0, 210.0, 275.0, 340.0];
+        let circle_px: Vec<[f64; 2]> = circle_angles_deg
+            .iter()
+            .filter_map(|deg| {
+                let theta = deg.to_radians();
+                let world_point = Point3::new(
+                    CENTER_CIRCLE_RADIUS_M * theta.cos(),
+                    CENTER_CIRCLE_RADIUS_M * theta.sin(),
+                    0.0,
+                );
+                project_world_point(&true_pose, &world_point, &true_camera, SOLVE_MAX_THETA_RAD)
+                    .map(|(px, py)| [px, py])
+            })
+            .collect();
+        assert!(circle_px.len() >= 5, "expected most circle samples visible");
+
+        let result = optimize_corners_and_circle(&corners_px, &circle_px, width, height, 300)
+            .expect("optimization should succeed");
 
         assert!(
             result.mean_reprojection_error_px < 5.0,

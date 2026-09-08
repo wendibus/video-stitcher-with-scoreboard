@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Reco - Court Calibration Editor</title>
+<title>Reco - Court Corners Editor</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a1a; color: #ddd; font-family: system-ui, sans-serif; }
@@ -17,7 +17,6 @@ body { background: #1a1a1a; color: #ddd; font-family: system-ui, sans-serif; }
 .header .info { color: #888; font-size: 12px; }
 .target { padding: 10px 20px; background: #2a3a4a; font-size: 15px; font-weight: 600; color: #9cf; }
 .target .done { color: #8f8; }
-.target .anchor { color: #fb5; }
 .canvas-wrap { position: relative; display: flex; justify-content: center; padding: 5px; overflow: hidden; height: calc(100vh - 100px); }
 canvas { cursor: crosshair; max-width: 100%; max-height: 100%; object-fit: contain; }
 .instructions { position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%); background: #333a; padding: 6px 14px; border-radius: 6px; font-size: 11px; color: #aaa; pointer-events: none; }
@@ -26,9 +25,8 @@ canvas { cursor: crosshair; max-width: 100%; max-height: 100%; object-fit: conta
 <body>
 
 <div class="header">
-  <h1>Court Calibration Editor</h1>
+  <h1>Court Corners Editor</h1>
   <button id="undoBtn" onclick="undo()">Undo</button>
-  <button id="skipBtn" onclick="skip()">Skip (not visible)</button>
   <span class="spacer"></span>
   <span class="info" id="pointCount">0 points</span>
   <button class="primary" id="saveBtn" onclick="saveAndClose()" disabled>Save Points</button>
@@ -40,8 +38,8 @@ canvas { cursor: crosshair; max-width: 100%; max-height: 100%; object-fit: conta
   <canvas id="canvas"></canvas>
 </div>
 
-<div class="instructions" id="instructions">
-  First mark which basket is FAR and which is NEAR - those markers stay on screen as a constant reference for every point after.
+<div class="instructions">
+  No need to label anything or track which basket is which - click the 4 outer court corners in any order, then click around the center circle. Undo reverts the last click.
 </div>
 
 <script>
@@ -50,22 +48,16 @@ const ctx = canvas.getContext('2d');
 const pointCountEl = document.getElementById('pointCount');
 const targetEl = document.getElementById('target');
 const saveBtn = document.getElementById('saveBtn');
-const instructionsEl = document.getElementById('instructions');
 
 // Data injected by Rust at generation time.
 const IMAGE_DATA = '{{IMAGE_DATA}}';
 const IMAGE_WIDTH = {{IMAGE_WIDTH}};
 const IMAGE_HEIGHT = {{IMAGE_HEIGHT}};
-const POINT_LABELS = {{POINT_LABELS_JSON}};
 
+const MIN_CIRCLE_POINTS = 5;
 let image = null;
-// Persistent reference markers - set once at the start, never affected by
-// Undo/Skip on the real point list below, drawn every frame so "which
-// basket is far/near" is never ambiguous partway through a long click-
-// through (the failure mode this whole anchor step exists to prevent).
-const anchors = { far: null, near: null };
-// history[i] is either {label, x, y} (clicked) or {label, skipped: true}.
-const history = [];
+const corners = []; // up to 4 {x,y}
+const circle = [];  // any number of {x,y}
 
 function loadImage(dataUri) {
   return new Promise((resolve, reject) => {
@@ -84,51 +76,22 @@ async function init() {
   redraw();
 }
 
-// Phase state machine: place the FAR anchor, then the NEAR anchor, then
-// walk through POINT_LABELS as before.
 function phase() {
-  if (!anchors.far) return 'anchor-far';
-  if (!anchors.near) return 'anchor-near';
-  return 'points';
-}
-
-function currentLabel() {
-  return history.length < POINT_LABELS.length ? POINT_LABELS[history.length] : null;
+  return corners.length < 4 ? 'corners' : 'circle';
 }
 
 function updateTarget() {
-  const p = phase();
-  if (p === 'anchor-far') {
-    targetEl.innerHTML = '<span class="anchor">Click anywhere near/on the basket you will call FAR</span>';
+  if (phase() === 'corners') {
+    targetEl.textContent = `Click court corner ${corners.length + 1} of 4 (any corner, any order)`;
     saveBtn.disabled = true;
-    return;
-  }
-  if (p === 'anchor-near') {
-    targetEl.innerHTML = '<span class="anchor">Now click anywhere near/on the OTHER basket - this one is NEAR</span>';
-    saveBtn.disabled = true;
-    return;
-  }
-  const label = currentLabel();
-  if (label) {
-    targetEl.textContent = `Click: ${label}  (${history.length + 1} / ${POINT_LABELS.length})`;
-    targetEl.classList.remove('done');
   } else {
-    targetEl.innerHTML = '<span class="done">All points done - click "Save Points".</span>';
+    const n = circle.length;
+    const enough = n >= MIN_CIRCLE_POINTS;
+    targetEl.innerHTML = enough
+      ? `<span class="done">${n} center-circle points clicked - click more for accuracy, or "Save Points" when done.</span>`
+      : `Click a point on the center circle (${n} so far, need at least ${MIN_CIRCLE_POINTS})`;
+    saveBtn.disabled = !enough;
   }
-  saveBtn.disabled = false;
-}
-
-function drawAnchor(x, y, label, color) {
-  ctx.beginPath();
-  ctx.arc(x, y, 10, 0, Math.PI * 2);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 3;
-  ctx.stroke();
-  ctx.fillStyle = color;
-  ctx.font = 'bold 13px system-ui';
-  ctx.textAlign = 'center';
-  ctx.fillText(label, x, y - 16);
-  ctx.textAlign = 'left';
 }
 
 function redraw() {
@@ -148,26 +111,26 @@ function redraw() {
   const w = canvas.width;
   const h = canvas.height;
 
-  if (anchors.far) drawAnchor(anchors.far.x * w, anchors.far.y * h, 'FAR', '#fb5');
-  if (anchors.near) drawAnchor(anchors.near.x * w, anchors.near.y * h, 'NEAR', '#5bf');
-
-  for (const entry of history) {
-    if (entry.skipped) continue;
-    const x = entry.x * w;
-    const y = entry.y * h;
+  corners.forEach((p, i) => {
+    const x = p.x * w, y = p.y * h;
     ctx.beginPath();
-    ctx.arc(x, y, 5, 0, Math.PI * 2);
-    ctx.fillStyle = '#0f0';
+    ctx.arc(x, y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#fb5';
     ctx.fill();
     ctx.fillStyle = '#fff';
-    ctx.font = '10px system-ui';
-    ctx.fillText(entry.label, x + 8, y - 6);
-  }
+    ctx.font = 'bold 11px system-ui';
+    ctx.fillText(`corner ${i + 1}`, x + 9, y - 8);
+  });
 
-  const clicked = history.filter(e => !e.skipped).length;
-  if (phase() === 'points' || history.length > 0) {
-    pointCountEl.textContent = `${clicked} / ${POINT_LABELS.length} points clicked`;
-  }
+  circle.forEach((p) => {
+    const x = p.x * w, y = p.y * h;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#5bf';
+    ctx.fill();
+  });
+
+  pointCountEl.textContent = `${corners.length} corners, ${circle.length} circle points`;
   updateTarget();
 }
 
@@ -175,50 +138,34 @@ canvas.addEventListener('click', (e) => {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
-  const x = (e.clientX - rect.left) * scaleX / canvas.width;
-  const y = (e.clientY - rect.top) * scaleY / canvas.height;
+  const x = Math.round(((e.clientX - rect.left) * scaleX / canvas.width) * 10000) / 10000;
+  const y = Math.round(((e.clientY - rect.top) * scaleY / canvas.height) * 10000) / 10000;
 
-  const p = phase();
-  if (p === 'anchor-far') {
-    anchors.far = { x, y };
-    redraw();
-    return;
+  if (phase() === 'corners') {
+    corners.push({ x, y });
+  } else {
+    circle.push({ x, y });
   }
-  if (p === 'anchor-near') {
-    anchors.near = { x, y };
-    redraw();
-    return;
-  }
-  const label = currentLabel();
-  if (!label) return;
-  history.push({ label, x: Math.round(x * 10000) / 10000, y: Math.round(y * 10000) / 10000 });
   redraw();
 });
 
 function undo() {
-  const p = phase();
-  if (p === 'anchor-near') {
-    anchors.far = null;
-  } else if (p === 'points' && history.length === 0) {
-    anchors.near = null;
-  } else {
-    history.pop();
+  if (circle.length > 0) {
+    circle.pop();
+  } else if (corners.length > 0) {
+    corners.pop();
   }
   redraw();
 }
 
-function skip() {
-  if (phase() !== 'points') return; // anchors are not skippable, only the real points are
-  const label = currentLabel();
-  if (!label) return;
-  history.push({ label, skipped: true });
-  redraw();
-}
-
 function saveAndClose() {
-  if (phase() !== 'points') return;
-  const points = history.filter(e => !e.skipped).map(e => ({ label: e.label, x: e.x, y: e.y }));
-  const payload = { width: canvas.width, height: canvas.height, points };
+  if (circle.length < MIN_CIRCLE_POINTS) return;
+  const payload = {
+    width: canvas.width,
+    height: canvas.height,
+    corners: corners.map(p => [p.x, p.y]),
+    circle: circle.map(p => [p.x, p.y]),
+  };
   const json = JSON.stringify(payload, null, 2);
 
   try {
@@ -226,12 +173,12 @@ function saveAndClose() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'court_points.json';
+    a.download = 'court_corners.json';
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    pointCountEl.textContent = 'Downloaded court_points.json - paste its path (or the raw JSON) back into the terminal.';
+    pointCountEl.textContent = 'Downloaded court_corners.json - paste its path (or the raw JSON) back into the terminal.';
     pointCountEl.style.color = '#8f8';
   } catch (e) {
     showManualCopy(json);

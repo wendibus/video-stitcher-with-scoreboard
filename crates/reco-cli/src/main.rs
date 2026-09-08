@@ -748,17 +748,17 @@ enum Commands {
         frame_time: f64,
 
         /// Skip the browser round-trip and use an already-saved
-        /// clicked-points JSON file (from a previous `court_points.json`
+        /// clicked-points JSON file (from a previous browser-tool
         /// download) instead.
         #[arg(long)]
         points: Option<String>,
 
         /// Skip the browser round-trip and instead ask a local Ollama
-        /// vision-language model (e.g. "qwen2.5vl:32b") to locate the
-        /// court points itself. The frame goes only to the local
-        /// Ollama endpoint - nothing leaves the machine. Unverified by
-        /// this process (never views the frame itself) - spot-check
-        /// the printed points and the reprojection error.
+        /// vision-language model (e.g. "qwen2.5vl:7b") to locate the
+        /// points itself. The frame goes only to the local Ollama
+        /// endpoint - nothing leaves the machine. Unverified by this
+        /// process (never views the frame itself) - spot-check the
+        /// printed points and the reprojection error.
         #[arg(long)]
         auto_model: Option<String>,
 
@@ -769,6 +769,14 @@ enum Commands {
         /// Max Nelder-Mead iterations per multi-start run.
         #[arg(long, default_value_t = 800)]
         max_iters: u64,
+
+        /// Use the older flow of ~30 individually-labeled points
+        /// (far-corner-left, near-3pt-a, etc.) instead of the default
+        /// 4-unlabeled-corners + center-circle flow. Only worth trying
+        /// if the default flow's reprojection error is unexpectedly
+        /// high on a camera with unusual geometry.
+        #[arg(long, default_value_t = false)]
+        legacy: bool,
 
         /// Output calibration JSON file path.
         #[arg(short, long, default_value = "mono_calibration.json")]
@@ -1237,6 +1245,7 @@ fn main() -> anyhow::Result<()> {
             auto_model,
             ollama_endpoint,
             max_iters,
+            legacy,
             output,
         } => calibrate_mono::run_calibrate_mono(
             &video,
@@ -1245,6 +1254,7 @@ fn main() -> anyhow::Result<()> {
             auto_model.as_deref(),
             &ollama_endpoint,
             max_iters,
+            legacy,
             &output,
         ),
 
