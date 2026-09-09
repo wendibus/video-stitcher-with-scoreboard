@@ -145,12 +145,16 @@ pub struct MonoStitchCore {
     frame_count: u64,
     session_start: Option<Instant>,
 
-    /// Panorama-space (yaw, pitch) range the panner's pose is clamped
-    /// to, inset from the projection's raw painted-region bounds by
-    /// half the output viewport's angular extent - see
-    /// [`Self::resolve_current_pose`]'s doc comment for why.
-    yaw_bounds: (f32, f32),
-    pitch_bounds: (f32, f32),
+    /// Panorama-space (yaw, pitch) range the camera's calibrated field
+    /// of view actually covers - the *un-inset* raw painted-region
+    /// bounds, computed once (camera + `max_theta_rad` never change
+    /// after construction). [`Self::clamp_pose_for_fov`] insets this
+    /// per-frame for whatever FOV the panner requests that frame,
+    /// since a wider FOV needs a larger inset margin (see its doc
+    /// comment) - this cannot be precomputed once the FOV itself can
+    /// vary frame to frame.
+    raw_yaw_bounds: (f32, f32),
+    raw_pitch_bounds: (f32, f32),
 }
 
 impl MonoStitchCore {
@@ -158,15 +162,9 @@ impl MonoStitchCore {
     pub fn new(gpu: GpuContext, config: MonoStitchCoreConfig) -> Result<Self, StitchCoreError> {
         let output_width = config.viewport.width;
         let output_height = config.viewport.height;
-        let fov_degrees = config.viewport.fov_degrees;
 
-        let (yaw_bounds, pitch_bounds) = Self::compute_pose_bounds(
-            &config.camera,
-            config.max_theta_rad,
-            fov_degrees,
-            output_width,
-            output_height,
-        );
+        let (raw_yaw_bounds, raw_pitch_bounds) =
+            kb4_mono_panorama_bounds(&config.camera, config.max_theta_rad);
 
         let pipeline = MonoPipeline::with_gpu(
             gpu,
@@ -196,42 +194,46 @@ impl MonoStitchCore {
             placeholder_calibration: crate::calibration::MatchCalibration::mono_placeholder(),
             frame_count: 0,
             session_start: None,
-            yaw_bounds,
-            pitch_bounds,
+            raw_yaw_bounds,
+            raw_pitch_bounds,
         })
     }
 
-    /// Inset [`kb4_mono_panorama_bounds`] by the output viewport's
-    /// *corner* half-angle, so a pose clamped to the result keeps the
-    /// *entire rendered frame* inside the camera's calibrated field of
-    /// view - not just its center ray - eliminating the black
-    /// out-of-coverage wedges a pose too close to the edge of the
-    /// camera's field of view produces.
+    /// Inset [`Self::raw_yaw_bounds`]/[`Self::raw_pitch_bounds`] by the
+    /// output viewport's *corner* half-angle for the given `fov_degrees`,
+    /// so a pose clamped to the result keeps the *entire rendered
+    /// frame* inside the camera's calibrated field of view - not just
+    /// its center ray - eliminating the black out-of-coverage wedges a
+    /// pose too close to the edge of the camera's field of view
+    /// produces. Takes `fov_degrees` as a parameter (rather than being
+    /// precomputed once) because the panner can request a different
+    /// FOV every frame (see [`Self::clamp_pose_for_fov`]) - a wider
+    /// requested FOV needs a proportionally larger inset margin, so
+    /// the safe yaw/pitch range genuinely shrinks as the panner zooms
+    /// out, and grows as it zooms in.
     ///
     /// Uses the corner angle (`atan(hypot(tan_half_h, tan_half_v))`),
     /// not the smaller edge-midpoint angles (`half_h_fov`/`half_v_fov`
     /// alone) - a rectangular viewport's corners sit further from its
     /// center than either edge's midpoint, since a corner combines
     /// both the horizontal *and* vertical offset simultaneously. Only
-    /// margining by the edge angles (the original version of this
+    /// margining by the edge angles (an earlier version of this
     /// function did) under-protects exactly the corners, which is
     /// what real-footage testing showed as a visible black-corner
     /// artifact even with pose nowhere near `yaw_min`/`yaw_max` alone.
     ///
-    /// Collapses to the midpoint on either axis where the viewport's
-    /// own FOV is wider than the available coverage (nothing sensible
-    /// to clamp to in that degenerate case - matches the L-shape
-    /// coverage code's "collapse to midpoint if bounds inverted"
-    /// fallback).
-    fn compute_pose_bounds(
-        camera: &CameraParams,
-        max_theta_rad: f32,
+    /// Collapses to the midpoint on either axis where the requested
+    /// FOV is wider than the available coverage (nothing sensible to
+    /// clamp to in that degenerate case - matches the L-shape coverage
+    /// code's "collapse to midpoint if bounds inverted" fallback).
+    fn inset_bounds_for_fov(
+        &self,
         fov_degrees: f32,
         output_width: u32,
         output_height: u32,
     ) -> ((f32, f32), (f32, f32)) {
-        let ((yaw_min, yaw_max), (pitch_min, pitch_max)) =
-            kb4_mono_panorama_bounds(camera, max_theta_rad);
+        let (yaw_min, yaw_max) = self.raw_yaw_bounds;
+        let (pitch_min, pitch_max) = self.raw_pitch_bounds;
 
         let half_v_fov = fov_degrees.to_radians() * 0.5;
         let aspect = output_width as f32 / output_height.max(1) as f32;
@@ -258,6 +260,24 @@ impl MonoStitchCore {
             inset(yaw_min, yaw_max, corner_margin),
             inset(pitch_min, pitch_max, corner_margin),
         )
+    }
+
+    /// Clamp a prospective pose (yaw/pitch/optional FOV request) so
+    /// the *entire rendered frame* stays inside this camera's
+    /// calibrated coverage - the mono counterpart of
+    /// [`StitchCore::safe_clamp`](super::StitchCore::safe_clamp) /
+    /// `pose.rs`'s `resolve_current_pose`. `pose.fov_degrees: None`
+    /// (no dynamic-zoom panner attached, or it chose not to request a
+    /// change this frame) falls back to the pipeline's current FOV.
+    fn clamp_pose_for_fov(&self, pose: ViewportPosition) -> ViewportPosition {
+        let fov = pose.fov_degrees.unwrap_or_else(|| self.pipeline.fov());
+        let (yaw_bounds, pitch_bounds) =
+            self.inset_bounds_for_fov(fov, self.output_width, self.output_height);
+        ViewportPosition {
+            yaw: pose.yaw.clamp(yaw_bounds.0, yaw_bounds.1),
+            pitch: pose.pitch.clamp(pitch_bounds.0, pitch_bounds.1),
+            fov_degrees: Some(fov),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -432,20 +452,25 @@ impl MonoStitchCore {
     }
 
     /// Resolve this frame's render pose from the attached panner, then
-    /// clamp it to [`Self::yaw_bounds`]/[`Self::pitch_bounds`] - the
-    /// panner (dead-zone/lookahead/velocity logic in
+    /// clamp it via [`Self::clamp_pose_for_fov`] - the panner (dead-
+    /// zone/lookahead/velocity/dynamic-zoom logic in
     /// [`reco_autocam::panners::FieldPanner`]) has no notion of "the
     /// projection runs out of painted video past here," so without
     /// this clamp a ball tracked near the edge of the source's angular
-    /// sweep drives the rendered crop straight into the shader's
-    /// out-of-coverage transparent (black-once-encoded) region.
+    /// sweep (or a panner zooming in tight enough that the frame edge
+    /// reaches past coverage) drives the rendered crop straight into
+    /// the shader's out-of-coverage transparent (black-once-encoded)
+    /// region. Also writes the resolved FOV back onto the pipeline
+    /// (mirrors `StitchCore`'s `pose.rs`) so the upcoming render
+    /// actually uses whatever zoom level the panner requested this
+    /// frame, instead of a fixed FOV frozen at construction time.
     fn resolve_current_pose(&mut self) -> ViewportPosition {
         let timestamp_ms = self
             .session_start
             .map(|s| s.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
 
-        let mut pose = crate::detect::panner::dispatch(
+        let raw = crate::detect::panner::dispatch(
             self.panner.as_mut(),
             self.player_tracker.as_mut(),
             self.ball_tracker.as_mut(),
@@ -463,9 +488,11 @@ impl MonoStitchCore {
         .map(|r| r.pose)
         .unwrap_or_default();
 
-        pose.yaw = pose.yaw.clamp(self.yaw_bounds.0, self.yaw_bounds.1);
-        pose.pitch = pose.pitch.clamp(self.pitch_bounds.0, self.pitch_bounds.1);
-        pose
+        let clamped = self.clamp_pose_for_fov(raw);
+        if let Some(fov) = clamped.fov_degrees {
+            self.pipeline.set_fov(fov);
+        }
+        clamped
     }
 }
 

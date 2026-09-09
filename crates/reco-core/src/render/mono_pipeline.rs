@@ -119,6 +119,20 @@ impl MonoPipeline {
         &self.viewport
     }
 
+    /// The output viewport's current vertical field of view, degrees.
+    pub fn fov(&self) -> f32 {
+        self.viewport.fov_degrees
+    }
+
+    /// Set the output viewport's vertical field of view for subsequent
+    /// [`Self::render_to_target`] calls - lets a panner zoom
+    /// dynamically frame to frame (mirrors
+    /// [`super::pipeline::StitchPipeline::set_fov`]). Clamped to the
+    /// same `(1.0, 179.0)` degree range that setter uses.
+    pub fn set_fov(&mut self, fov_degrees: f32) {
+        self.viewport.fov_degrees = fov_degrees.clamp(1.0, 179.0);
+    }
+
     /// Input frame dimensions as `(width, height)`.
     pub fn source_info(&self) -> (u32, u32) {
         (self.input_width, self.input_height)
